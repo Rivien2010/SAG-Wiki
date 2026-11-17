@@ -8,8 +8,15 @@ name: Fork build (unsigned installers)
 # installers and uploads them as artifacts (14-day retention). No signing,
 # no release draft. It mirrors the upstream build job step for step, minus
 # the validate dependency and the main-only cache saves.
+# NOTE: this workflow lives only on stage1, and GitHub only discovers
+# workflows from the default branch (main) — so neither the web UI's
+# "Run workflow" button nor the API dispatch endpoint can see it (both 404).
+# It therefore also triggers on push to stage1: pushing this file (or any
+# later stage1 commit) starts the build automatically.
 on:
   workflow_dispatch:
+  push:
+    branches: [stage1]
 
 permissions:
   contents: read
