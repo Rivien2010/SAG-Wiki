@@ -354,7 +354,20 @@ pub fn install_conan_component(
     let mut manifest = fs::File::create(staging.path().join("manifest.json"))?;
     manifest.write_all(&serde_json::to_vec(&ComponentManifest { model: model_digest, tokenizer: tokenizer_digest })?)?;
     manifest.sync_all()?;
-    fs::rename(staging.path(), &destination)?;
+    drop(manifest);
+    // Close every handle inside the staging directory before renaming it.
+    // On Windows the rename can be refused while a freshly written file is
+    // still open or being scanned, so retry briefly instead of failing the
+    // install outright.
+    let mut renamed = fs::rename(staging.path(), &destination);
+    for _ in 0..4 {
+        if renamed.is_ok() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        renamed = fs::rename(staging.path(), &destination);
+    }
+    renamed?;
     ModelSignature::new(&destination.join("model_int8.onnx"), &destination.join("tokenizer.json"), revision)
 }
 
@@ -494,7 +507,10 @@ mod tests {
         let path = _dir.path().join("broken-model.md");
         fs::write(&path, "# Text survives\nA chunk without a cached vector.\n").unwrap();
         assert!(store.index_file(&root, &path, 1000).unwrap());
-        assert!(store.connection().query_row("SELECT COUNT(*) FROM documents WHERE path=?", [path.to_str().unwrap()], |r| r.get::<_, i64>(0)).unwrap() > 0);
+        // index_file stores the canonical path (see index_file); compare
+        // against it, not the raw tempdir path (they differ under symlinks).
+        let canonical = path.canonicalize().unwrap();
+        assert!(store.connection().query_row("SELECT COUNT(*) FROM documents WHERE path=?", [canonical.to_str().unwrap()], |r| r.get::<_, i64>(0)).unwrap() > 0);
     }
 
     #[test]

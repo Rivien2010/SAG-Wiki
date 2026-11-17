@@ -779,7 +779,10 @@ mod tests {
         store.index_file(&root, &buried, 20000).unwrap();
         store.index_file(&root, &short, 20000).unwrap();
         let bm25 = store.candidate_query(&match_query("40天"), None, &[], &[], &[], 1).unwrap();
-        assert_eq!(bm25[0].path, short.to_str().unwrap());
+        // Stored paths are canonical (see index_file); compare against the
+        // canonical path, which differs from the raw tempdir path under symlinks.
+        let canonical_short = short.canonicalize().unwrap();
+        assert_eq!(bm25[0].path, canonical_short.to_str().unwrap());
         let exact = grep_leg(&store, "40天", &[], &[], 1).unwrap();
         assert_ne!(exact[0], bm25[0].id);
         let output = retrieve(&store, "40天", &[], &[],

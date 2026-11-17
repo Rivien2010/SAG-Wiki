@@ -1671,6 +1671,14 @@ impl Store {
         Ok(count)
     }
     pub fn index_file(&self, root: &str, path: &Path, max_chars: usize) -> Result<bool> {
+        // Roots are stored canonical (see add_root). A file path that reaches
+        // here through a symlink (macOS /tmp -> /private/tmp, Windows short
+        // names) would otherwise fail strip_prefix against the canonical root
+        // ("prefix not found"). Canonicalize first so both sides agree; keep
+        // the raw path when it cannot be resolved so missing-file behaviour
+        // is unchanged.
+        let path_buf = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+        let path = path_buf.as_path();
         let mut ignore = ignore_rules::matcher(Path::new(root));
         let mut rules = crate::folder_index::Rules::new(Path::new(root), &self.settings()?)?;
         if ignore_rules::is_ignored(&mut ignore, path, false)? || text::in_hidden_directory(Path::new(root), path, false)
