@@ -330,6 +330,53 @@ impl CliService {
             Command::Status => Ok(Response::Status(self.status()?)),
             Command::List => Ok(Response::Roots(self.store.roots()?)),
             Command::Check => Ok(Response::Checked(self.check(&request.path)?)),
+            Command::TestRetrieval(options) => {
+                // Like List, the panel addresses the current store, regardless
+                // of cwd. Apply the existing access/readiness checks per root.
+                let roots = self.store.roots()?;
+                if roots.is_empty() { bail!("尚未添加索引目录，请运行 sag add") }
+                let mut scopes = Vec::new();
+                for root in roots {
+                    let (path, authorized) = self.authorized(Path::new(&root.path))?;
+                    if !self.index_ready(&path)? { bail!("目录索引未就绪") }
+                    scopes.extend(authorized);
+                }
+                scopes.sort();
+                scopes.dedup();
+                self.release_preparation()?;
+                let output = crate::retrieval_panel::run(&self.store, &self.client, &self.data,
+                    &self.store.settings()?, &scopes, &options, &cancel).await?;
+                for scope in scopes { self.authorized(Path::new(&scope))?; }
+                Ok(Response::RetrievalPanel(output))
+            }
+            Command::BackfillVectors => {
+                let roots = self.store.roots()?;
+                if roots.is_empty() { bail!("尚未添加索引目录，请运行 sag add") }
+                let mut scopes = Vec::new();
+                for root in roots {
+                    let (path, authorized) = self.authorized(Path::new(&root.path))?;
+                    if !self.index_ready(&path)? { bail!("目录索引未就绪") }
+                    scopes.extend(authorized);
+                }
+                self.release_preparation()?;
+                let documents = {
+                    let db = self.store.connection();
+                    let mut query = db.prepare("SELECT DISTINCT c.document_id FROM chunks c WHERE NOT EXISTS (SELECT 1 FROM vec_conan WHERE rowid=c.id)")?;
+                    let rows = query.query_map([], |row| row.get::<_, i64>(0))?
+                        .collect::<rusqlite::Result<Vec<_>>>()?;
+                    rows
+                };
+                let mut total = crate::embedding::VectorIndexOutcome::default();
+                for id in documents {
+                    if cancel.is_cancelled() { bail!("向量回填已取消") }
+                    let outcome = crate::embedding::index_document_vectors(&self.store, id)?;
+                    total.encoded += outcome.encoded;
+                    total.failed += outcome.failed;
+                    total.skipped_no_model += outcome.skipped_no_model;
+                }
+                for scope in scopes { self.authorized(Path::new(&scope))?; }
+                Ok(Response::VectorsBackfilled(total))
+            }
             Command::Configure { enable, url, model, key, auth_mode } => {
                 if enable { self.configure(Access { enabled: true })?; }
                 let mut settings = self.store.settings()?;

@@ -73,6 +73,10 @@ Markdown, plain text, RTF, Office documents, spreadsheets, EPUB and text-based P
 
 Body chunks target approximately 512 characters by default, preserving complete sentences; code preserves complete lines. Very long sentences or lines may exceed the target. Chunks retain heading paths, and adjacent chunks overlap by approximately 80 characters of complete sentences or lines. Custom lengths are stored in retrieval settings. Base64 image data in HTML is excluded from the index and vocabulary.
 
+Chunking can vary by document shape: Hierarchy builds a heading tree and keeps the full parent heading path on every chunk (e.g. `Part 1 > Chapter 3 > Section 2`); Table splits by row, each chunk carrying the header plus a context window around the row; Presentation splits by slide; ParentChild retrieves on small child chunks and expands a hit to its parent chunk for full context. Since 2026-11-14, the default is automatic detection by document shape: `.md`, `.markdown` → Hierarchy; `.csv`, `.tsv`, `.xls`, `.xlsx`, `.ods` → Table; `.ppt`, `.pptx`, `.key`, `.odp` → Presentation; everything else → General. A per-document manual override (`set_chunk_method`) always wins over automatic detection. Converted documents (Office, spreadsheets) resolve the source file from the converted output path and inherit its method.
+
+Hierarchy, Table, Slide (Presentation) and ParentChild apply the same embedded-resource filtering rule as General: `data:` URIs and `<svg>` blocks are excluded from chunk content, source spans and line ranges. A Table document with a header but no data rows still produces one chunk containing the header line.
+
 Removing a directory from the knowledge base clears only its index and registration. Removing a subdirectory persists an exclusion; adding it again restores it. Original files are always preserved.
 
 ## Retrieval and Q&A
@@ -87,11 +91,43 @@ BM25 recalls candidates, Jev judges evidence relevance, configured term expansio
 
 Q&A uses the configured candidate and result counts. Desktop deep search has a separate limit for displayed files. The CLI's `-m` controls the final output count. All share the same underlying retrieval implementation.
 
+### Entity graph
+
+The model extracts entities and relations from documents (default entity types: person, organization, product, regulation, location, other; default relations: owns, part_of, caused_by, regulates, located_in, other), stored in local SQLite and filterable by document, type and name; re-extraction is skipped when a document's extraction fingerprint is unchanged. Graph retrieval seeds on entity names or vector-ranked entities, expands along relations, and returns the anchored chunks as evidence. Extraction calls the answer model and needs a configured model key; the graph view is consumed by the UI.
+
+### Agent Wiki pages
+
+The agent can generate a structured Wiki page from a topic and retrieved evidence (title, sections, a citation number per fact, `[[Title]]` links to related existing pages), save it as a Markdown note and index it immediately, so it is searchable the moment it lands; deleting a Wiki page removes the file, its index entry and its note records together. Generation calls the answer model and needs a configured model key.
+
 ### Q&A and tools
 
 The answer model calls built-in `search`, `list`, `read`, `grep` or configured external MCP tools as needed. Each turn shares a context budget. Tool calls are unlimited by default, with an optional shared limit. Tool results carry stable source numbers, and answer citations refer to the corresponding original sources.
 
 Request failures, context-limit violations, changed files and indexes that are not ready return explicit states without silently switching algorithms. See [Built-in MCP tools](https://github.com/Zleap-AI/SAG-Wiki/blob/main/docs/en/mcp-tools.md) for the protocol.
+
+## Stage 3 core APIs
+
+These capabilities live in Rust core modules and have no UI or CLI entry points yet.
+
+### Reranking
+
+`core/src/rerank.rs` provides a `Reranker` trait. Retrieval config defaults `rerank_enabled` to `false` and `rerank_candidate_pool` to 128, clamped to 64–256. `retrieve_fused_reranked` reranks fusion output; enabling it without a configured scorer returns an explicit error instead of silently retaining fusion order. No production ONNX scorer is bundled yet. It defaults off because Python measurements with `bge-reranker-v2-m3` scored 3.0/5 on the full 128-block pool and 2.5/5 on the three-leg top-50 union, both below quota-fusion A1's 4.0/5.
+
+### Composable pipelines
+
+`core/src/pipeline.rs` defines Parser → Chunker → Compiler → Indexer components, with registration, versions and configs stored in SQLite tables `pipeline_components`, `pipeline_versions` and `pipeline_configs`. Built-ins are Parser `anydoc` (fast) / `docling` (accurate); Chunker `general` / `hierarchy` / `table` / `presentation` / `parent-child`; Compiler `fts` (FTS5 only) / `fts-vector` (FTS + vector legs); and Indexer `sqlite`. `publish_pipeline` validates referenced components and increments the version. Named configs store a pipeline version plus rerank settings for reuse.
+
+### Local HTTP service
+
+`core/src/http_api.rs` provides an HTTP service for coding agents, listening only on `127.0.0.1`. `GET /health` returns `{"status":"ok"}`; `GET /search?q=...&top_k=...` returns chunk-level JSON results with citation locations: path and start/end line ranges. Discovery uses `sag-http.json` in the data directory, containing the port and PID.
+
+### Chunk administration and metadata
+
+`core/src/chunk_admin.rs` provides `list_chunks` previews, `split_chunk` / `merge_chunks`, and `set_chunk_boundaries`, a manual boundary override applied on the next index that takes precedence over the chunking method. Document metadata includes author, date and source; `documents_matching_metadata` selects matching documents, and `search_with_metadata_filter` filters search by metadata.
+
+### Agentic helpers
+
+`core/src/agentic.rs` provides a multi-round retrieval decision layer, defaulting to at most 3 rounds and a minimum evidence threshold of 5; it stops at the round cap, sufficient evidence or no new evidence. `verify_citations` mechanically checks `[N]` citations, marks invalid citations `[N?]` and reports them; it does not judge whether source content supports a claim. Chunk enrichment generates tags, keywords and questions through an LLM, is off by default and runs only on demand. `search_with_enrichment` widens recall using stored enrichment; with none stored, it behaves like plain search.
 
 ## UI and document display
 

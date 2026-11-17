@@ -190,6 +190,93 @@ impl ModelConfig {
         !self.model.trim().is_empty() && (self.auth_mode == ModelAuthMode::None || self.has_key)
     }
 }
+/// Retrieval mode: `fast` runs SAG2 only (the pre-existing behaviour);
+/// `accurate` fuses SAG2 with the vector legs (Conan / WeMM) via RRF +
+/// per-group quota. The mode is a user setting; it defaults to `fast` so
+/// existing behaviour is unchanged until the user opts in.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RetrievalMode {
+    #[default]
+    Fast,
+    Accurate,
+}
+
+/// Local embedding models. WeMM is never bundled or automatically downloaded.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
+pub struct EmbeddingConfig {
+    #[serde(default = "default_conan_model")]
+    pub conan_model: String,
+    #[serde(default = "default_conan_dim")]
+    pub conan_dim: usize,
+    #[serde(default = "default_wemm_model")]
+    pub wemm_model: String,
+    #[serde(default = "default_wemm_dim")]
+    pub wemm_dim: usize,
+    #[serde(default = "default_wemm_on_demand")]
+    pub wemm_on_demand: bool,
+}
+fn default_conan_model() -> String {
+    "TencentBAC/Conan-embedding-v1".into()
+}
+fn default_conan_dim() -> usize {
+    1792
+}
+fn default_wemm_model() -> String {
+    "tencent/WeMM-Embedding-2B".into()
+}
+fn default_wemm_dim() -> usize {
+    1024
+}
+fn default_wemm_on_demand() -> bool {
+    true
+}
+impl Default for EmbeddingConfig {
+    fn default() -> Self {
+        Self {
+            conan_model: default_conan_model(),
+            conan_dim: default_conan_dim(),
+            wemm_model: default_wemm_model(),
+            wemm_dim: default_wemm_dim(),
+            wemm_on_demand: default_wemm_on_demand(),
+        }
+    }
+}
+
+/// Allowed extraction vocabulary. Validate before using a saved schema.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct GraphSchema {
+    pub version: String,
+    pub entity_types: Vec<String>,
+    pub relation_types: Vec<String>,
+}
+impl Default for GraphSchema {
+    fn default() -> Self {
+        Self {
+            version: "1".into(),
+            entity_types: ["person", "org", "product", "regulation", "location", "other"].map(String::from).to_vec(),
+            relation_types: ["owns", "part_of", "caused_by", "regulates", "located_in", "other"].map(String::from).to_vec(),
+        }
+    }
+}
+impl GraphSchema {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.version.trim().is_empty() { return Err("empty schema version".into()); }
+        for names in [&self.entity_types, &self.relation_types] {
+            let mut seen = std::collections::HashSet::new();
+            if names.is_empty() { return Err("empty schema vocabulary".into()); }
+            for name in names {
+                if name.trim().is_empty() || name.trim() != name || !seen.insert(name) {
+                    return Err(format!("empty, untrimmed or duplicate schema type: {name:?}"));
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Retrieval {
@@ -199,6 +286,43 @@ pub struct Retrieval {
     pub max_hops: usize,
     pub top_k: usize,
     pub chunk_chars: usize,
+    /// Fast (SAG2 only) or accurate (multi-leg fusion). Defaults to fast.
+    pub mode: RetrievalMode,
+    /// RRF damping constant for multi-leg fusion (validated value: 60).
+    pub rrf_k: usize,
+    /// Per-group quota for fusion (validated value: 5). A "group" is the
+    /// source author as determined by `models::source_author` (title/heading).
+    pub quota_per_author: usize,
+    /// How many ranked chunks each leg contributes to fusion (validated: 50).
+    pub top_k_per_leg: usize,
+    /// Final result count for accurate-mode fusion; SAG2 retains `top_k`.
+    pub top_k_final: usize,
+    pub embedding: EmbeddingConfig,
+    pub graph_schema: GraphSchema,
+    /// Reserved retrieval knobs for vector integration; do not alter SAG2 scoring.
+    pub keyword_weight: f64,
+    pub vector_weight: f64,
+    pub similarity_threshold: f64,
+    /// Retrieval legs enabled for accurate mode, in order. The SAG2 leg is
+    /// always available; vector legs (`conan`, `wemm`) are skipped when their
+    /// embedding model is missing (graceful degradation).
+    pub legs: Vec<String>,
+    /// Extra BM25 queries for vocabulary-mismatched evidence missed by the main legs.
+    #[serde(default)]
+    pub variant_queries: Vec<String>,
+    /// Optional rerank stage (Stage 3, 11.1-11.2). Off by default; when on,
+    /// the fused pool is reordered by a cross-encoder before the final cut.
+    /// Measured on the reference corpus, reranking scored below quota fusion
+    /// (3.0/2.5 vs 4.0/5), so it stays off unless a model is configured.
+    #[serde(default)]
+    pub rerank_enabled: bool,
+    /// Candidate pool size for reranking, clamped to 64-256.
+    #[serde(default = "default_rerank_pool")]
+    pub rerank_candidate_pool: usize,
+}
+
+fn default_rerank_pool() -> usize {
+    128
 }
 impl Default for Retrieval {
     fn default() -> Self {
@@ -209,6 +333,20 @@ impl Default for Retrieval {
             max_hops: 1,
             top_k: 10,
             chunk_chars: 512,
+            mode: RetrievalMode::Fast,
+            rrf_k: 60,
+            quota_per_author: 5,
+            top_k_per_leg: 50,
+            top_k_final: 10,
+            embedding: EmbeddingConfig::default(),
+            graph_schema: GraphSchema::default(),
+            keyword_weight: 0.8,
+            vector_weight: 0.25,
+            similarity_threshold: 0.2,
+            legs: vec!["conan".to_owned(), "sag".to_owned(), "wemm".to_owned()],
+            variant_queries: vec![],
+            rerank_enabled: false,
+            rerank_candidate_pool: 128,
         }
     }
 }
@@ -514,7 +652,12 @@ mod default_tests {
 
     #[test]
     fn retrieval_defaults_to_v10() {
-        let expected = serde_json::json!({"candidate_k":50,"seed_k":10,"expansion_term_limit":20,"max_hops":1,"top_k":10,"chunk_chars":512});
+        // Snapshot of the full Retrieval default. HEAD's Retrieval had only
+        // the six fields below; Stage 1 added mode/weights/legs/quota/rerank
+        // without updating this snapshot, so it has failed since Stage 1.
+        // This refresh records the complete current default (incl. the B1
+        // `variant_queries` field, empty by default).
+        let expected = serde_json::json!({"candidate_k":50,"seed_k":10,"expansion_term_limit":20,"max_hops":1,"top_k":10,"chunk_chars":512,"mode":"fast","rrf_k":60,"quota_per_author":5,"top_k_per_leg":50,"top_k_final":10,"keyword_weight":0.8,"vector_weight":0.25,"similarity_threshold":0.2,"legs":["conan","sag","wemm"],"variant_queries":[],"rerank_enabled":false,"rerank_candidate_pool":128,"embedding":{"conan_dim":1792,"conan_model":"TencentBAC/Conan-embedding-v1","wemm_dim":1024,"wemm_model":"tencent/WeMM-Embedding-2B","wemm_on_demand":true},"graph_schema":{"entity_types":["person","org","product","regulation","location","other"],"relation_types":["owns","part_of","caused_by","regulates","located_in","other"],"version":"1"}});
         assert_eq!(
             serde_json::to_value(Settings::default().retrieval).unwrap(),
             expected

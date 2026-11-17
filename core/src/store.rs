@@ -275,6 +275,7 @@ impl Store {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
+        crate::vector_store::register_extension()?;
         let db = Connection::open(path)?;
         register_rank(&db)?;
         db.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000;
@@ -288,18 +289,80 @@ impl Store {
  CREATE INDEX IF NOT EXISTS index_issues_root ON index_issues(root);
  CREATE TABLE IF NOT EXISTS documents(id INTEGER PRIMARY KEY AUTOINCREMENT,root TEXT NOT NULL,path TEXT UNIQUE NOT NULL,name TEXT NOT NULL,hash TEXT NOT NULL,mtime INTEGER NOT NULL,size INTEGER NOT NULL DEFAULT 0);
  CREATE TABLE IF NOT EXISTS chunks(id INTEGER PRIMARY KEY AUTOINCREMENT,document_id INTEGER NOT NULL REFERENCES documents(id) ON DELETE CASCADE,heading TEXT NOT NULL,ranges TEXT NOT NULL,start_line INTEGER NOT NULL,end_line INTEGER NOT NULL,spans TEXT NOT NULL DEFAULT '[]');
+ CREATE UNIQUE INDEX IF NOT EXISTS chunks_id_document ON chunks(id,document_id);
+ CREATE TABLE IF NOT EXISTS entities(
+   id INTEGER PRIMARY KEY AUTOINCREMENT,
+   document_id INTEGER NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+   name TEXT NOT NULL CHECK(length(trim(name))>0),
+   type TEXT NOT NULL CHECK(length(trim(type))>0),
+   chunk_id INTEGER NOT NULL,
+   created_at INTEGER NOT NULL DEFAULT (unixepoch()),
+   UNIQUE(document_id,name,type,chunk_id), UNIQUE(id,document_id),
+   FOREIGN KEY(chunk_id,document_id) REFERENCES chunks(id,document_id) ON DELETE CASCADE
+ );
+ CREATE INDEX IF NOT EXISTS entities_document ON entities(document_id);
+ CREATE INDEX IF NOT EXISTS entities_name ON entities(name);
+ CREATE TABLE IF NOT EXISTS relations(
+   id INTEGER PRIMARY KEY AUTOINCREMENT,
+   document_id INTEGER NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+   subject_id INTEGER NOT NULL,
+   relation TEXT NOT NULL CHECK(length(trim(relation))>0),
+   object_id INTEGER NOT NULL,
+   weight REAL NOT NULL,
+   chunk_id INTEGER NOT NULL,
+   created_at INTEGER NOT NULL DEFAULT (unixepoch()),
+   UNIQUE(subject_id,relation,object_id,chunk_id),
+   FOREIGN KEY(subject_id,document_id) REFERENCES entities(id,document_id) ON DELETE CASCADE,
+   FOREIGN KEY(object_id,document_id) REFERENCES entities(id,document_id) ON DELETE CASCADE,
+   FOREIGN KEY(chunk_id,document_id) REFERENCES chunks(id,document_id) ON DELETE CASCADE
+ );
+ CREATE INDEX IF NOT EXISTS relations_subject ON relations(subject_id);
+ CREATE INDEX IF NOT EXISTS relations_object ON relations(object_id);
+ CREATE INDEX IF NOT EXISTS relations_document ON relations(document_id);
+ CREATE TABLE IF NOT EXISTS graph_extractions(
+   document_id INTEGER PRIMARY KEY REFERENCES documents(id) ON DELETE CASCADE,
+   fingerprint TEXT NOT NULL
+ );
+ CREATE TRIGGER IF NOT EXISTS chunks_invalidate_graph AFTER DELETE ON chunks BEGIN
+   DELETE FROM graph_extractions WHERE document_id=OLD.document_id;
+ END;
  CREATE INDEX IF NOT EXISTS chunks_doc ON chunks(document_id);
  CREATE INDEX IF NOT EXISTS docs_root ON documents(root);
  CREATE VIRTUAL TABLE IF NOT EXISTS chunk_fts USING fts5(title,heading,body,content='',contentless_delete=1);
  CREATE VIRTUAL TABLE IF NOT EXISTS chunk_vocab USING fts5vocab(chunk_fts,'col');
+ CREATE VIRTUAL TABLE IF NOT EXISTS vec_conan USING vec0(embedding bit[1792]);
+ CREATE VIRTUAL TABLE IF NOT EXISTS vec_wemm USING vec0(embedding float[1024] distance_metric=cosine);
+ CREATE TABLE IF NOT EXISTS embedding_cache(chunk_hash TEXT NOT NULL,model TEXT NOT NULL,vector BLOB NOT NULL,created_at INTEGER NOT NULL,PRIMARY KEY(chunk_hash,model));
+ CREATE TRIGGER IF NOT EXISTS chunks_delete_vectors AFTER DELETE ON chunks BEGIN
+   DELETE FROM vec_conan WHERE rowid=OLD.id;
+   DELETE FROM vec_wemm WHERE rowid=OLD.id;
+ END;
  CREATE TABLE IF NOT EXISTS preferences(id INTEGER PRIMARY KEY CHECK(id=1),value TEXT NOT NULL);
  CREATE TABLE IF NOT EXISTS conversations(id TEXT PRIMARY KEY,title TEXT NOT NULL,messages TEXT NOT NULL,updated INTEGER NOT NULL,deleted INTEGER NOT NULL DEFAULT 0);
  CREATE TABLE IF NOT EXISTS drafts(path TEXT PRIMARY KEY,value TEXT NOT NULL);
  CREATE TABLE IF NOT EXISTS metadata(id INTEGER PRIMARY KEY CHECK(id=1),version INTEGER NOT NULL);
+ CREATE TABLE IF NOT EXISTS import_checkpoints(path TEXT PRIMARY KEY REFERENCES documents(path) ON DELETE CASCADE ON UPDATE CASCADE,hash TEXT NOT NULL,mtime INTEGER NOT NULL,size INTEGER NOT NULL,chunk_chars INTEGER NOT NULL);
+ CREATE TABLE IF NOT EXISTS chunk_methods(path TEXT PRIMARY KEY,method TEXT NOT NULL);
+ CREATE TABLE IF NOT EXISTS pipeline_components(kind TEXT NOT NULL,name TEXT NOT NULL,version TEXT NOT NULL,description TEXT NOT NULL DEFAULT '',PRIMARY KEY(kind,name));
+ CREATE TABLE IF NOT EXISTS pipeline_versions(name TEXT NOT NULL,version INTEGER NOT NULL,parser TEXT NOT NULL,chunker TEXT NOT NULL,compiler TEXT NOT NULL,indexer TEXT NOT NULL,created_at INTEGER NOT NULL,PRIMARY KEY(name,version));
+ CREATE TABLE IF NOT EXISTS pipeline_configs(name TEXT PRIMARY KEY,pipeline_name TEXT NOT NULL,pipeline_version INTEGER NOT NULL,rerank_enabled INTEGER NOT NULL DEFAULT 0,rerank_pool INTEGER NOT NULL DEFAULT 128);
+ CREATE TABLE IF NOT EXISTS chunk_overrides(path TEXT PRIMARY KEY,boundaries TEXT NOT NULL);
+ CREATE TABLE IF NOT EXISTS document_metadata(path TEXT PRIMARY KEY,author TEXT NOT NULL DEFAULT '',date TEXT NOT NULL DEFAULT '',source TEXT NOT NULL DEFAULT '');
+ CREATE TABLE IF NOT EXISTS chunk_enrichments(chunk_id INTEGER PRIMARY KEY REFERENCES chunks(id) ON DELETE CASCADE,tags TEXT NOT NULL DEFAULT '[]',keywords TEXT NOT NULL DEFAULT '[]',questions TEXT NOT NULL DEFAULT '[]');
  CREATE TABLE IF NOT EXISTS retrieval_vocabulary(document_id INTEGER PRIMARY KEY REFERENCES documents(id) ON DELETE CASCADE,terms TEXT NOT NULL);
  CREATE TABLE IF NOT EXISTS explore_summaries(document_id INTEGER PRIMARY KEY REFERENCES documents(id) ON DELETE CASCADE,hash TEXT NOT NULL,algorithm INTEGER NOT NULL,terms TEXT NOT NULL);
  INSERT OR IGNORE INTO metadata VALUES(1,0);
 ")?;
+        // Seed built-in pipeline components (12.1); custom registrations persist.
+        for component in crate::pipeline::builtin_components() {
+            db.execute(
+                "INSERT OR IGNORE INTO pipeline_components(kind,name,version,description) VALUES(?1,?2,?3,?4)",
+                params![component.kind.as_str(), component.name, component.version, component.description],
+            )?;
+        }
+        if !db.query_row("SELECT EXISTS(SELECT 1 FROM pragma_table_info('roots') WHERE name='weight')", [], |r| r.get::<_, bool>(0))? {
+            db.execute_batch("ALTER TABLE roots ADD COLUMN weight REAL NOT NULL DEFAULT 1.0;")?;
+        }
         db.execute_batch(notes_index::SCHEMA)?;
         let has_size: bool = db.query_row(
             "SELECT EXISTS(SELECT 1 FROM pragma_table_info('documents') WHERE name='size')",
@@ -334,6 +397,7 @@ impl Store {
         )?;
         if stores_body {
             db.execute_batch("BEGIN;
+                DROP TRIGGER IF EXISTS chunks_delete_fts;
                 DROP TABLE chunk_vocab;
                 DROP TABLE chunk_fts;
                 DELETE FROM chunks;
@@ -371,6 +435,8 @@ impl Store {
         } else {
             db.pragma_update(None, "user_version", 9)?;
         }
+        // Install after legacy migrations, which temporarily replace the FTS table.
+        db.execute_batch("CREATE TRIGGER IF NOT EXISTS chunks_delete_fts AFTER DELETE ON chunks BEGIN DELETE FROM chunk_fts WHERE rowid=OLD.id; END;")?;
         // Slots are cheap; open read connections only when a configured worker is used.
         let query_readers = (0..64).map(|_| Mutex::new(None)).collect();
         let saved: Option<String> = db.query_row("SELECT value FROM preferences WHERE id=1", [], |r| r.get(0)).optional()?;
@@ -430,6 +496,10 @@ impl Store {
                         settings.retrieval = Retrieval::default();
                     }
                     settings.retrieval.max_hops = settings.retrieval.max_hops.min(2);
+                    if settings.retrieval.keyword_weight == 0.7 && settings.retrieval.vector_weight == 0.3 {
+                        settings.retrieval.keyword_weight = 0.8;
+                        settings.retrieval.vector_weight = 0.25;
+                    }
                     settings.retrieval_version = crate::sag2_v10::VERSION;
                 }
                 settings
@@ -617,6 +687,7 @@ impl Store {
         )?;
         if busy { bail!("正在索引，请等待当前任务完成后再清除所有数据") }
         tx.execute_batch("DELETE FROM conversations;
+            DELETE FROM embedding_cache;
             DELETE FROM index_history;
             DELETE FROM drafts;
             DELETE FROM preferences;
@@ -727,6 +798,22 @@ impl Store {
         if root.status == "partial" { self.finish_indexing(&root.path)?; }
         Ok(())
     }
+    pub fn root_weight(&self, root: &str) -> Result<f64> {
+        Ok(self.connection().query_row("SELECT weight FROM roots WHERE path=?", [root], |r| r.get(0))?)
+    }
+    pub fn set_root_weight(&self, root: &str, weight: f64) -> Result<()> {
+        if !weight.is_finite() || weight < 0. { bail!("文件夹权重须为有限非负数") }
+        let mut db = self.connection();
+        let tx = db.transaction()?;
+        anyhow::ensure!(tx.execute("UPDATE roots SET weight=? WHERE path=?", params![weight, root])? == 1, "文件夹不存在");
+        tx.execute("UPDATE metadata SET version=version+1", [])?;
+        tx.commit()?;
+        Ok(())
+    }
+    pub(crate) fn document_weight(&self, document: i64) -> Result<f64> {
+        Ok(self.connection().query_row("SELECT coalesce(r.weight,1.0) FROM documents d LEFT JOIN roots r ON r.path=d.root WHERE d.id=?", [document], |r| r.get(0))?)
+    }
+
     pub fn remove_root(&self, path: &str) -> Result<()> {
         let mut c = self.connection();
         let tx = c.transaction()?;
@@ -1107,6 +1194,8 @@ impl Store {
                         let tx = db.transaction()?;
                         Self::write_prepared(&tx, root, file)?;
                         tx.commit()?;
+                        drop(db);
+                        self.index_vectors_best_effort(&path);
                     }
                     count += 1;
                     completed += 1;
@@ -1341,6 +1430,8 @@ impl Store {
                         let tx = db.transaction()?;
                         Self::write_prepared(&tx, root, file)?;
                         tx.commit()?;
+                        drop(db);
+                        self.index_vectors_best_effort(&output);
                     }
                 }
                 progress(IndexProgress { count: index + 1, total: sources.len() });
@@ -1395,6 +1486,8 @@ impl Store {
             fs::rename(&staged, output)?;
             published = true;
             tx.commit()?;
+            drop(db);
+            self.index_vectors_best_effort(output);
             Ok(())
         })();
         if let Err(error) = outcome {
@@ -1473,6 +1566,25 @@ impl Store {
         }
         Ok(files)
     }
+    fn import_checkpoint_matches(&self, path: &Path, chunk_chars: usize) -> Result<bool> {
+        let Ok(metadata) = fs::metadata(path) else { return Ok(false); };
+        let mtime = metadata.modified()?.duration_since(UNIX_EPOCH)?.as_nanos() as i64;
+        Ok(self.connection().query_row("SELECT EXISTS(SELECT 1 FROM import_checkpoints p JOIN documents d ON d.path=p.path
+            WHERE p.path=?1 AND p.hash=d.hash AND p.hash<>'' AND p.mtime=d.mtime AND p.size=d.size AND p.mtime=?2 AND p.size=?3 AND p.chunk_chars=?4
+            AND NOT EXISTS(SELECT 1 FROM index_issues WHERE path=p.path))",
+            params![path_text(path)?, mtime, metadata.len() as i64, chunk_chars], |r| r.get(0))?)
+    }
+    fn save_import_checkpoint(tx: &rusqlite::Transaction<'_>, path: &Path, chunk_chars: usize) -> Result<()> {
+        // The checkpoint and completed document share a commit. A crash can
+        // expose neither half-written chunks nor a checkpoint ahead of them.
+        tx.execute("INSERT INTO import_checkpoints(path,hash,mtime,size,chunk_chars)
+            SELECT path,hash,mtime,size,?2 FROM documents WHERE path=?1 AND hash<>''
+            AND NOT EXISTS(SELECT 1 FROM index_issues WHERE path=?1)
+            ON CONFLICT(path) DO UPDATE SET hash=excluded.hash,mtime=excluded.mtime,size=excluded.size,chunk_chars=excluded.chunk_chars",
+            params![path_text(path)?, chunk_chars])?;
+        Ok(())
+    }
+
     fn scan_directory(&self, root: &str, directory: &Path, files: &[PathBuf], settings: &Settings, verify: bool, converted_only: Option<bool>, progress: impl Fn(IndexProgress)) -> Result<usize> {
         let mut seen = HashSet::new();
         let mut count = 0;
@@ -1490,6 +1602,16 @@ impl Store {
             let mut window = Vec::new();
             let mut reserved = 0;
             while next < files.len() && window.len() < settings.index_workers {
+                // Resumed bulk scans skip completed files before dispatching any
+                // parsing work. Explicit verification still re-reads source hashes.
+                if !verify && self.import_checkpoint_matches(&files[next], settings.retrieval.chunk_chars)? {
+                    seen.insert(path_text(&files[next])?);
+                    next += 1;
+                    count += 1;
+                    if count % 20 == 0 { progress(IndexProgress { count, total }); }
+                    self.indexing.checkpoint_root(root)?;
+                    continue;
+                }
                 let bytes = preparation_reservation_with_runtime(&files[next], &settings.runtime);
                 if reserved + bytes > settings.runtime.text_preparation_mib * 1024 * 1024 { break; }
                 window.push((&files[next], bytes));
@@ -1502,20 +1624,21 @@ impl Store {
                 let mut handles = Vec::new();
                 for (path, bytes) in window {
                     seen.insert(path_text(path)?);
-                    handles.push(scope.spawn(move || {
+                    handles.push((path, scope.spawn(move || {
                         let result = self.indexing.file(root, path, || self.prepare_file_at_with_runtime(root, path, path, max_chars, verify, bytes, &settings.runtime));
                         self.prepared_or_issue(root, path, result)
-                    }));
+                    })));
                 }
-                for handle in handles {
+                for (path, handle) in handles {
                     let prepared = handle.join().expect("index worker panicked")?;
                     self.indexing.checkpoint_root(root)?;
-                    if let Some(file) = prepared {
-                        let mut db = self.connection();
-                        let tx = db.transaction()?;
-                        Self::write_prepared(&tx, root, file)?;
-                        tx.commit()?;
-                    }
+                    let mut db = self.connection();
+                    let tx = db.transaction()?;
+                    if let Some(file) = prepared { Self::write_prepared(&tx, root, file)?; }
+                    Self::save_import_checkpoint(&tx, path, max_chars)?;
+                    tx.commit()?;
+                    drop(db);
+                    self.index_vectors_best_effort(path);
                     count += 1;
                     if count % 20 == 0 { progress(IndexProgress { count, total }); }
                 }
@@ -1562,8 +1685,47 @@ impl Store {
         let tx = db.transaction()?;
         let changed = Self::write_prepared(&tx, root, file)?;
         tx.commit()?;
+        drop(db);
+        self.index_vectors_best_effort(path);
         Ok(changed)
     }
+
+    /// Contentless FTS cannot return body text. Reuse retrieval hydration,
+    /// including byte spans and source freshness, with one read per document.
+    pub(crate) fn vector_chunk_bodies(&self, document_id: i64) -> Result<HashMap<i64, String>> {
+        let metadata = {
+            let db = self.connection();
+            let mut query = db.prepare("SELECT c.id,d.id,d.path,d.name,c.heading,c.start_line,c.end_line,c.ranges,0.0,d.hash,c.spans
+                FROM chunks c JOIN documents d ON d.id=c.document_id
+                WHERE c.document_id=?1 AND NOT EXISTS (SELECT 1 FROM vec_conan WHERE rowid=c.id)")?;
+            let mut rows = query.query([document_id])?;
+            let mut metadata = Vec::new();
+            while let Some(row) = rows.next()? { metadata.push(candidate_metadata(row, 0)?); }
+            metadata
+        };
+        let mut documents = HashMap::new();
+        let mut bodies = HashMap::new();
+        for candidate in metadata {
+            if let Some(candidate) = hydrate_candidate(candidate, &mut documents)? {
+                bodies.insert(candidate.id, candidate.content);
+            }
+        }
+        Ok(bodies)
+    }
+
+    fn index_vectors_best_effort(&self, path: &Path) {
+        let run = || -> Result<()> {
+            let id: Option<i64> = self.connection().query_row(
+                "SELECT id FROM documents WHERE path=?", [path_text(path)?], |row| row.get(0),
+            ).optional()?;
+            if let Some(id) = id { crate::embedding::index_document_vectors(self, id)?; }
+            Ok(())
+        };
+        if let Err(error) = run() {
+            eprintln!("Conan vector indexing unavailable for {}: {error:#}", path.display());
+        }
+    }
+
     fn prepare_file(&self, root: &str, path: &Path, max_chars: usize, verify: bool) -> Result<Option<PreparedFile>> {
         self.prepare_file_with_runtime(root, path, max_chars, verify, &self.runtime_settings())
     }
@@ -1622,7 +1784,12 @@ impl Store {
         let name = path.file_name().unwrap().to_string_lossy().to_string();
         let title = text::index_text(&name);
         let prepared_limit = (runtime.max_prepared_text_mib * 1024 * 1024).min(reserved / 2);
-        let source_chunks = text::chunks_for_index(&body, max_chars, path, prepared_limit / 2)?;
+        let method = self.chunk_method_for_index(&path_string);
+        // 14.1: a manual boundary override wins over the chunking method.
+        let source_chunks = match self.chunk_boundaries(&path_string)? {
+            Some(boundaries) => crate::chunking::chunks_from_boundaries(&body, &boundaries, path),
+            None => crate::chunking::chunks_for_index_with_method(&body, max_chars, path, method, prepared_limit / 2)?,
+        };
         let mut used = 0usize;
         let mut chunks = Vec::with_capacity(source_chunks.len());
         for chunk in source_chunks {
@@ -2057,6 +2224,54 @@ impl Store {
         transaction.commit()?;
         Ok(found)
     }
+    /// Resolve a vector hit without requiring a lexical match. Apply the same
+    /// scope/conversion rules and source freshness checks as lexical candidates.
+    pub(crate) fn candidate_by_id(
+        &self,
+        id: i64,
+        scope: &[String],
+        references: &[String],
+    ) -> Result<Option<Candidate>> {
+        let c = self.connection();
+        let version = c.query_row("SELECT version FROM metadata WHERE id=1", [], |r| r.get(0))?;
+        let documents = self.scope_document_ids(&c, version, scope, references)?;
+        let mut q = c.prepare("SELECT c.id,d.id,d.path,d.name,c.heading,c.start_line,c.end_line,c.ranges,0.0,d.hash,c.spans
+            FROM chunks c JOIN documents d ON d.id=c.document_id
+            WHERE c.id=?1 AND (?2 IS NULL OR d.id IN (SELECT value FROM json_each(?2)))")?;
+        let mut rows = q.query(params![id, documents.as_deref()])?;
+        match rows.next()? {
+            Some(row) => candidate_from_row(row, 0, &mut HashMap::new()),
+            None => Ok(None),
+        }
+    }
+
+    /// Literal scan in document/chunk order, independent of BM25's top-N cutoff.
+    /// Hydrate one document at a time so the scan never retains the corpus text.
+    pub(crate) fn literal_candidates(&self, literal: &str, scope: &[String], references: &[String], limit: usize) -> Result<Vec<Candidate>> {
+        if literal.trim().is_empty() || limit == 0 { return Ok(vec![]); }
+        let db = self.connection();
+        let version = db.query_row("SELECT version FROM metadata WHERE id=1", [], |r| r.get(0))?;
+        let documents = self.scope_document_ids(&db, version, scope, references)?;
+        let mut query = db.prepare("SELECT c.id,d.id,d.path,d.name,c.heading,c.start_line,c.end_line,c.ranges,0.0,d.hash,c.spans
+            FROM chunks c JOIN documents d ON d.id=c.document_id
+            WHERE (?1 IS NULL OR d.id IN (SELECT value FROM json_each(?1))) ORDER BY d.id,c.id")?;
+        let mut rows = query.query([documents.as_deref()])?;
+        let mut result = vec![];
+        let mut cache = HashMap::new();
+        let mut previous = None;
+        while let Some(row) = rows.next()? {
+            let document: i64 = row.get(1)?;
+            if previous != Some(document) { cache.clear(); previous = Some(document); }
+            if let Some(candidate) = candidate_from_row(row, result.len(), &mut cache)? {
+                if candidate.content.contains(literal) {
+                    result.push(candidate);
+                    if result.len() == limit { break; }
+                }
+            }
+        }
+        Ok(result)
+    }
+
     pub fn reference_candidates(
         &self,
         references: &[String],
@@ -2203,6 +2418,240 @@ impl Store {
             .connection()
             .query_row("SELECT COUNT(*) FROM chunks", [], |r| r.get::<_, i64>(0))?
             as usize)
+    }
+    /// Per-document chunking method override (10.5). Unset documents use
+    /// the General chunker; `method_for_path` is only a suggestion.
+    pub fn set_chunk_method(&self, path: &str, method: crate::chunking::ChunkMethod) -> Result<()> {
+        self.connection().execute(
+            "INSERT INTO chunk_methods(path,method) VALUES(?1,?2) ON CONFLICT(path) DO UPDATE SET method=excluded.method",
+            params![path, method.as_str()],
+        )?;
+        Ok(())
+    }
+    pub fn chunk_method_for(&self, path: &str) -> Result<crate::chunking::ChunkMethod> {
+        Ok(self.chunk_method_override(path)?.unwrap_or_default())
+    }
+    /// Register a pipeline component (12.1). Built-ins are seeded on open;
+    /// a custom component with the same kind+name replaces the built-in.
+    pub fn register_component(&self, component: &crate::pipeline::PipelineComponent) -> Result<()> {
+        self.connection().execute(
+            "INSERT INTO pipeline_components(kind,name,version,description) VALUES(?1,?2,?3,?4) ON CONFLICT(kind,name) DO UPDATE SET version=excluded.version,description=excluded.description",
+            params![component.kind.as_str(), component.name, component.version, component.description],
+        )?;
+        Ok(())
+    }
+    pub fn list_components(&self, kind: Option<crate::pipeline::ComponentKind>) -> Result<Vec<crate::pipeline::PipelineComponent>> {
+        let db = self.connection();
+        let mut stmt = db.prepare("SELECT kind,name,version,description FROM pipeline_components WHERE (?1 IS NULL OR kind=?1) ORDER BY kind,name")?;
+        let rows = stmt.query_map([kind.map(|k| k.as_str())], |r| {
+            Ok(crate::pipeline::PipelineComponent {
+                kind: crate::pipeline::ComponentKind::from_str(&r.get::<_, String>(0)?).unwrap_or(crate::pipeline::ComponentKind::Parser),
+                name: r.get(1)?,
+                version: r.get(2)?,
+                description: r.get(3)?,
+            })
+        })?.collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+    /// Publish a pipeline version (12.1): validate every referenced
+    /// component exists, then freeze the combination under the next version.
+    pub fn publish_pipeline(&self, name: &str, parser: &str, chunker: &str, compiler: &str, indexer: &str) -> Result<crate::pipeline::PipelineVersion> {
+        for (kind, component) in [
+            (crate::pipeline::ComponentKind::Parser, parser),
+            (crate::pipeline::ComponentKind::Chunker, chunker),
+            (crate::pipeline::ComponentKind::Compiler, compiler),
+            (crate::pipeline::ComponentKind::Indexer, indexer),
+        ] {
+            let exists: bool = self.connection().query_row(
+                "SELECT EXISTS(SELECT 1 FROM pipeline_components WHERE kind=?1 AND name=?2)",
+                params![kind.as_str(), component],
+                |r| r.get(0),
+            )?;
+            if !exists {
+                anyhow::bail!("流水线组件不存在：{} {}", kind.as_str(), component);
+            }
+        }
+        let version: i64 = self.connection().query_row(
+            "SELECT COALESCE(MAX(version),0)+1 FROM pipeline_versions WHERE name=?",
+            [name],
+            |r| r.get(0),
+        )?;
+        let created_at = now();
+        self.connection().execute(
+            "INSERT INTO pipeline_versions(name,version,parser,chunker,compiler,indexer,created_at) VALUES(?1,?2,?3,?4,?5,?6,?7)",
+            params![name, version, parser, chunker, compiler, indexer, created_at],
+        )?;
+        Ok(crate::pipeline::PipelineVersion { name: name.to_string(), version, parser: parser.to_string(), chunker: chunker.to_string(), compiler: compiler.to_string(), indexer: indexer.to_string(), created_at })
+    }
+    pub fn pipeline_version(&self, name: &str, version: i64) -> Result<Option<crate::pipeline::PipelineVersion>> {
+        let row = self.connection().query_row(
+            "SELECT name,version,parser,chunker,compiler,indexer,created_at FROM pipeline_versions WHERE name=?1 AND version=?2",
+            params![name, version],
+            |r| Ok(crate::pipeline::PipelineVersion { name: r.get(0)?, version: r.get(1)?, parser: r.get(2)?, chunker: r.get(3)?, compiler: r.get(4)?, indexer: r.get(5)?, created_at: r.get(6)? }),
+        ).optional()?;
+        Ok(row)
+    }
+    pub fn latest_pipeline_version(&self, name: &str) -> Result<Option<crate::pipeline::PipelineVersion>> {
+        let row = self.connection().query_row(
+            "SELECT name,version,parser,chunker,compiler,indexer,created_at FROM pipeline_versions WHERE name=?1 ORDER BY version DESC LIMIT 1",
+            [name],
+            |r| Ok(crate::pipeline::PipelineVersion { name: r.get(0)?, version: r.get(1)?, parser: r.get(2)?, chunker: r.get(3)?, compiler: r.get(4)?, indexer: r.get(5)?, created_at: r.get(6)? }),
+        ).optional()?;
+        Ok(row)
+    }
+    /// Save a named pipeline config (12.2). The referenced pipeline version
+    /// must exist.
+    pub fn save_pipeline_config(&self, config: &crate::pipeline::PipelineConfig) -> Result<()> {
+        if self.pipeline_version(&config.pipeline_name, config.pipeline_version)?.is_none() {
+            anyhow::bail!("流水线版本不存在：{} v{}", config.pipeline_name, config.pipeline_version);
+        }
+        self.connection().execute(
+            "INSERT INTO pipeline_configs(name,pipeline_name,pipeline_version,rerank_enabled,rerank_pool) VALUES(?1,?2,?3,?4,?5) ON CONFLICT(name) DO UPDATE SET pipeline_name=excluded.pipeline_name,pipeline_version=excluded.pipeline_version,rerank_enabled=excluded.rerank_enabled,rerank_pool=excluded.rerank_pool",
+            params![config.name, config.pipeline_name, config.pipeline_version, config.rerank_enabled as i64, config.rerank_pool as i64],
+        )?;
+        Ok(())
+    }
+    pub fn pipeline_config(&self, name: &str) -> Result<Option<crate::pipeline::PipelineConfig>> {
+        let row = self.connection().query_row(
+            "SELECT name,pipeline_name,pipeline_version,rerank_enabled,rerank_pool FROM pipeline_configs WHERE name=?",
+            [name],
+            |r| Ok(crate::pipeline::PipelineConfig { name: r.get(0)?, pipeline_name: r.get(1)?, pipeline_version: r.get(2)?, rerank_enabled: r.get::<_, i64>(3)? != 0, rerank_pool: r.get::<_, i64>(4)? as usize }),
+        ).optional()?;
+        Ok(row)
+    }
+    pub fn list_pipeline_configs(&self) -> Result<Vec<crate::pipeline::PipelineConfig>> {
+        let db = self.connection();
+        let mut stmt = db.prepare("SELECT name,pipeline_name,pipeline_version,rerank_enabled,rerank_pool FROM pipeline_configs ORDER BY name")?;
+        let rows = stmt.query_map([], |r| {
+            Ok(crate::pipeline::PipelineConfig { name: r.get(0)?, pipeline_name: r.get(1)?, pipeline_version: r.get(2)?, rerank_enabled: r.get::<_, i64>(3)? != 0, rerank_pool: r.get::<_, i64>(4)? as usize })
+        })?.collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+    /// Save a per-document chunk boundary override (14.1). The indexer
+    /// applies it on the next index instead of the chunking method.
+    pub fn set_chunk_boundaries(&self, path: &str, boundaries: &[crate::chunk_admin::ChunkBoundary]) -> Result<()> {
+        let json = serde_json::to_string(boundaries)?;
+        self.connection().execute(
+            "INSERT INTO chunk_overrides(path,boundaries) VALUES(?1,?2) ON CONFLICT(path) DO UPDATE SET boundaries=excluded.boundaries",
+            params![path, json],
+        )?;
+        Ok(())
+    }
+    pub fn chunk_boundaries(&self, path: &str) -> Result<Option<Vec<crate::chunk_admin::ChunkBoundary>>> {
+        let found: Option<String> = self
+            .connection()
+            .query_row("SELECT boundaries FROM chunk_overrides WHERE path=?", [path], |r| r.get(0))
+            .optional()?;
+        match found {
+            Some(json) => Ok(Some(serde_json::from_str(&json)?)),
+            None => Ok(None),
+        }
+    }
+    /// Set document metadata (14.2): author/date/source.
+    pub fn set_document_metadata(&self, path: &str, metadata: &crate::chunk_admin::DocumentMetadata) -> Result<()> {
+        self.connection().execute(
+            "INSERT INTO document_metadata(path,author,date,source) VALUES(?1,?2,?3,?4) ON CONFLICT(path) DO UPDATE SET author=excluded.author,date=excluded.date,source=excluded.source",
+            params![path, metadata.author, metadata.date, metadata.source],
+        )?;
+        Ok(())
+    }
+    pub fn document_metadata(&self, path: &str) -> Result<crate::chunk_admin::DocumentMetadata> {
+        let row = self.connection().query_row(
+            "SELECT author,date,source FROM document_metadata WHERE path=?",
+            [path],
+            |r| Ok(crate::chunk_admin::DocumentMetadata { author: r.get(0)?, date: r.get(1)?, source: r.get(2)? }),
+        ).optional()?;
+        Ok(row.unwrap_or_default())
+    }
+    /// Paths whose metadata matches the filter (14.2). Empty filter fields
+    /// match everything.
+    pub fn documents_matching_metadata(&self, filter: &crate::chunk_admin::MetadataFilter) -> Result<Vec<String>> {
+        let db = self.connection();
+        let mut stmt = db.prepare(
+            "SELECT d.path FROM documents d LEFT JOIN document_metadata m ON m.path=d.path WHERE (?1='' OR COALESCE(m.author,'') LIKE '%'||?1||'%') AND (?2='' OR COALESCE(m.date,'') LIKE '%'||?2||'%') AND (?3='' OR COALESCE(m.source,'') LIKE '%'||?3||'%')",
+        )?;
+        let rows = stmt.query_map(params![filter.author, filter.date, filter.source], |r| r.get(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+    /// Save LLM enrichment for a chunk (15.3).
+    pub fn save_chunk_enrichment(&self, enrichment: &crate::agentic::ChunkEnrichment) -> Result<()> {
+        self.connection().execute(
+            "INSERT INTO chunk_enrichments(chunk_id,tags,keywords,questions) VALUES(?1,?2,?3,?4) ON CONFLICT(chunk_id) DO UPDATE SET tags=excluded.tags,keywords=excluded.keywords,questions=excluded.questions",
+            params![
+                enrichment.chunk_id,
+                serde_json::to_string(&enrichment.tags)?,
+                serde_json::to_string(&enrichment.keywords)?,
+                serde_json::to_string(&enrichment.questions)?,
+            ],
+        )?;
+        Ok(())
+    }
+    /// Chunk ids whose stored enrichment matches any query term (15.3).
+    /// Scope restricts by document path prefix; empty scope means all.
+    pub fn chunks_matching_enrichment(&self, query: &str, scope: &[String]) -> Result<Vec<i64>> {
+        let terms: Vec<&str> = query.split_whitespace().filter(|t| !t.is_empty()).collect();
+        if terms.is_empty() {
+            return Ok(vec![]);
+        }
+        let mut sql = String::from(
+            "SELECT e.chunk_id FROM chunk_enrichments e JOIN chunks c ON c.id=e.chunk_id JOIN documents d ON d.id=c.document_id WHERE (",
+        );
+        for (i, _) in terms.iter().enumerate() {
+            if i > 0 {
+                sql.push_str(" OR ");
+            }
+            sql.push_str(&format!("e.tags LIKE '%'||?{}||'%' OR e.keywords LIKE '%'||?{}||'%' OR e.questions LIKE '%'||?{}||'%'", i + 1, i + 1, i + 1));
+        }
+        sql.push(')');
+        if !scope.is_empty() {
+            sql.push_str(" AND (");
+            for (i, _) in scope.iter().enumerate() {
+                if i > 0 {
+                    sql.push_str(" OR ");
+                }
+                sql.push_str(&format!("d.path LIKE ?{}||'%'", terms.len() + i + 1));
+            }
+            sql.push(')');
+        }
+        let db = self.connection();
+        let mut stmt = db.prepare(&sql)?;
+        let mut params: Vec<&dyn rusqlite::types::ToSql> = vec![];
+        for term in &terms {
+            params.push(term);
+        }
+        for s in scope {
+            params.push(s);
+        }
+        let rows = stmt.query_map(&params[..], |r| r.get(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+    /// Stored per-document override, if any (10.5).
+    pub fn chunk_method_override(&self, path: &str) -> Result<Option<crate::chunking::ChunkMethod>> {
+        let found: Option<String> = self
+            .connection()
+            .query_row("SELECT method FROM chunk_methods WHERE path=?", [path], |r| r.get(0))
+            .optional()?;
+        Ok(found.and_then(|m| crate::chunking::ChunkMethod::from_str(&m)))
+    }
+    /// Chunk method used when indexing a document (10.5, auto-detect
+    /// default confirmed 2026-11-14): the document's own override, else the
+    /// source file's override (for converted files, derived from the output
+    /// path — the conversions row is written only after the converted file
+    /// is chunked), else auto-detect by shape (.md -> Hierarchy, table
+    /// files -> Table, presentations -> Presentation, everything else
+    /// General). A manual override in config always wins.
+    pub fn chunk_method_for_index(&self, path: &str) -> crate::chunking::ChunkMethod {
+        if let Ok(Some(method)) = self.chunk_method_override(path) {
+            return method;
+        }
+        let effective = crate::docling::source_path_from_output(Path::new(path))
+            .unwrap_or_else(|| Path::new(path).to_path_buf());
+        if let Ok(source_text) = path_text(&effective) {
+            if let Ok(Some(method)) = self.chunk_method_override(&source_text) {
+                return method;
+            }
+        }
+        crate::chunking::method_for_path(&effective)
     }
     pub fn conversations(&self) -> Result<Vec<Conversation>> {
         let c = self.connection();
@@ -2418,6 +2867,84 @@ mod tests {
         store.frequencies(&["alpha".into(), "beta".into()]).unwrap();
         assert_eq!(store.query_readers.iter().filter(|reader| reader.lock().unwrap().is_some()).count(), 1);
         assert_eq!(store.runtime_settings().query_workers, 1);
+    }
+
+    #[test]
+    fn bulk_import_resumes_persisted_checkpoint_without_preparing_completed_files() {
+        let (dir, store, root) = setup();
+        for id in 0..40 {
+            fs::write(root.join(format!("{id:02}.txt")), format!("checkpoint evidence {id}")).unwrap();
+        }
+        let mut settings = store.settings().unwrap();
+        settings.index_workers = 1;
+        store.save_settings(&settings).unwrap();
+        let root_text = root.to_str().unwrap();
+        assert!(store.scan(root_text, |p| {
+            if p.count == 20 { store.indexing.cancel_root(root_text); }
+        }).is_err());
+        let rows = |store: &Store, sql: &str| -> Vec<(String, i64)> {
+            store.connection().prepare(sql).unwrap().query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+                .unwrap().collect::<rusqlite::Result<_>>().unwrap()
+        };
+        let finished = rows(&store, "SELECT d.path,c.id FROM documents d JOIN chunks c ON c.document_id=d.id ORDER BY d.path");
+        assert_eq!(finished.len(), 20);
+        assert_eq!(store.connection().query_row("SELECT count(*) FROM import_checkpoints", [], |r| r.get::<_, usize>(0)).unwrap(), 20);
+        drop(store);
+        let store = Store::open(&dir.path().join("app/db.sqlite")).unwrap();
+        let prepared = std::cell::Cell::new(0);
+        assert_eq!(store.scan(root_text, |_| {
+            prepared.set(store.indexing.log(root_text).iter().filter(|entry| entry.stage == "indexing_native").count());
+        }).unwrap(), 40);
+        assert_eq!(prepared.get(), 20, "completed files must not be dispatched for preparation again");
+        let all = rows(&store, "SELECT d.path,c.id FROM documents d JOIN chunks c ON c.document_id=d.id ORDER BY d.path");
+        assert_eq!(all.len(), 40);
+        for completed in finished { assert!(all.contains(&completed), "resuming must preserve completed chunk ids"); }
+        assert_eq!(store.connection().query_row("SELECT count(*) FROM import_checkpoints", [], |r| r.get::<_, usize>(0)).unwrap(), 40);
+        // An explicit verification must invalidate the resume shortcut, even
+        // when an external editor preserves file size and modification time.
+        let changed = root.join("00.txt");
+        let modified = fs::metadata(&changed).unwrap().modified().unwrap();
+        fs::write(&changed, "checkpoint evidence X").unwrap();
+        fs::File::options().write(true).open(&changed).unwrap()
+            .set_times(fs::FileTimes::new().set_modified(modified)).unwrap();
+        store.verify_root(root_text).unwrap();
+        store.scan(root_text, |_| {}).unwrap();
+        assert_eq!(store.candidate_query(&text::match_query("X"), None, &[], &[], &[], 10).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn prune_scan_and_remove_event_clear_fts_vectors_and_checkpoints() {
+        use crate::vector_store::{self, Vector, CONAN_BYTES, WEMM_DIM};
+        let (_dir, store, root) = setup();
+        let files = [root.join("first.txt"), root.join("second.txt")];
+        for path in &files { fs::write(path, "prunemarker 40天").unwrap(); }
+        let root_text = root.to_str().unwrap();
+        store.scan(root_text, |_| {}).unwrap();
+        let hits = store.candidate_query(&text::match_query("prunemarker"), None, &[], &[], &[], 10).unwrap();
+        assert_eq!(hits.len(), 2);
+        for hit in hits {
+            vector_store::write_vector(&store, "conan", hit.id, Vector::Conan(&[0; CONAN_BYTES])).unwrap();
+            vector_store::write_vector(&store, "wemm", hit.id, Vector::Wemm(&vec![1.; WEMM_DIM])).unwrap();
+        }
+        fs::remove_file(&files[0]).unwrap();
+        crate::indexer::apply_request(&store, crate::indexer::IndexRequest::Paths {
+            root: root_text.into(), paths: vec![files[0].clone()],
+        }, |_| {}).unwrap();
+        for table in ["chunks", "chunk_fts", "vec_conan", "vec_wemm", "import_checkpoints"] {
+            assert_eq!(store.connection().query_row(&format!("SELECT count(*) FROM {table}"), [], |r| r.get::<_, usize>(0)).unwrap(), 1, "{table}");
+        }
+        fs::remove_file(&files[1]).unwrap();
+        store.scan(root_text, |_| {}).unwrap();
+        for table in ["chunks", "chunk_fts", "vec_conan", "vec_wemm", "import_checkpoints"] {
+            assert_eq!(store.connection().query_row(&format!("SELECT count(*) FROM {table}"), [], |r| r.get::<_, usize>(0)).unwrap(), 0, "{table}");
+        }
+        assert!(store.candidate_query(&text::match_query("prunemarker"), None, &[], &[], &[], 10).unwrap().is_empty());
+        assert!(crate::retrieval::grep_leg(&store, "40天", &[], &[], 10).unwrap().is_empty());
+        // Direct cascades are protected too, even without an explicit FTS delete.
+        fs::write(&files[0], "cascadeprobe").unwrap();
+        store.scan(root_text, |_| {}).unwrap();
+        store.connection().execute("DELETE FROM documents", []).unwrap();
+        assert_eq!(store.connection().query_row("SELECT count(*) FROM chunk_fts", [], |r| r.get::<_, usize>(0)).unwrap(), 0);
     }
 
     fn setup() -> (tempfile::TempDir, Store, PathBuf) {
@@ -2882,6 +3409,74 @@ while [ ! -f "$(dirname "$0")/release" ]; do sleep 0.02; done
     }
 
     #[test]
+    fn per_document_chunk_method_changes_indexed_chunks() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("files");
+        fs::create_dir(&root).unwrap();
+        let store = Store::open(&dir.path().join("index.sqlite")).unwrap();
+        let root_key = store.add_root(&root).unwrap();
+        let root = root.canonicalize().unwrap();
+        // CSV: General gives one chunk; Table gives one chunk per row.
+        let csv = root.join("table.csv");
+        fs::write(&csv, "型号,价格\nBCD-215,1999\nBCD-300,2999\n").unwrap();
+        let csv_text = path_text(&csv).unwrap();
+        assert_eq!(store.chunk_method_for(&csv_text).unwrap(), crate::chunking::ChunkMethod::General);
+        store.set_chunk_method(&csv_text, crate::chunking::ChunkMethod::Table).unwrap();
+        assert_eq!(store.chunk_method_for(&csv_text).unwrap(), crate::chunking::ChunkMethod::Table);
+        // Markdown: Hierarchy keeps the full parent path on each chunk.
+        let doc = root.join("guide.md");
+        fs::write(&doc, "# Part 1 总论\n总论。\n\n## Chapter 1 第一章\n第一章内容。\n").unwrap();
+        let doc_text = path_text(&doc).unwrap();
+        store.set_chunk_method(&doc_text, crate::chunking::ChunkMethod::Hierarchy).unwrap();
+        store.scan(&root_key, |_| {}).unwrap();
+        let headings: Vec<String> = {
+            let db = store.connection();
+            let mut stmt = db.prepare("SELECT heading FROM chunks ORDER BY id").unwrap();
+            stmt.query_map([], |r| r.get(0)).unwrap().collect::<rusqlite::Result<Vec<_>>>().unwrap()
+        };
+        assert_eq!(headings.iter().filter(|h| *h == "| 型号 | 价格 |").count(), 3, "table rows (converted Markdown header): {headings:?}");
+        assert!(headings.iter().any(|h| h == "Part 1 总论 > Chapter 1 第一章"), "hierarchy paths: {headings:?}");
+        // Both files stay searchable.
+        assert_eq!(store.search_files("BCD-215", &[], 5).unwrap().len(), 1);
+        assert_eq!(store.search_files("第一章内容", &[], 5).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn pipeline_registry_versions_and_named_configs() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("index.sqlite")).unwrap();
+        // 12.1: built-ins are seeded on open.
+        let components = store.list_components(None).unwrap();
+        assert!(components.iter().any(|c| c.kind == crate::pipeline::ComponentKind::Parser && c.name == "anydoc"));
+        assert!(components.iter().any(|c| c.kind == crate::pipeline::ComponentKind::Chunker && c.name == "hierarchy"));
+        // Custom components register on top.
+        store.register_component(&crate::pipeline::PipelineComponent {
+            kind: crate::pipeline::ComponentKind::Chunker,
+            name: "legal".into(),
+            version: "1".into(),
+            description: "法规切分".into(),
+        }).unwrap();
+        assert!(store.list_components(Some(crate::pipeline::ComponentKind::Chunker)).unwrap().iter().any(|c| c.name == "legal"));
+        // Publishing validates components and bumps versions.
+        let v1 = store.publish_pipeline("default", "anydoc", "hierarchy", "fts", "sqlite").unwrap();
+        assert_eq!(v1.version, 1);
+        let v2 = store.publish_pipeline("default", "docling", "table", "fts-vector", "sqlite").unwrap();
+        assert_eq!(v2.version, 2);
+        assert!(store.publish_pipeline("default", "anydoc", "nope", "fts", "sqlite").is_err());
+        assert_eq!(store.latest_pipeline_version("default").unwrap().unwrap().version, 2);
+        assert_eq!(store.pipeline_version("default", 1).unwrap().unwrap().chunker, "hierarchy");
+        // 12.2: named configs save, load and reuse; unknown versions rejected.
+        let config = crate::pipeline::PipelineConfig { name: "books".into(), pipeline_name: "default".into(), pipeline_version: 1, rerank_enabled: false, rerank_pool: 128 };
+        store.save_pipeline_config(&config).unwrap();
+        let loaded = store.pipeline_config("books").unwrap().unwrap();
+        assert_eq!(loaded, config);
+        assert_eq!(loaded.chunk_method(&v1).unwrap(), crate::chunking::ChunkMethod::Hierarchy);
+        assert_eq!(store.list_pipeline_configs().unwrap().len(), 1);
+        let bad = crate::pipeline::PipelineConfig { name: "bad".into(), pipeline_name: "default".into(), pipeline_version: 99, rerank_enabled: false, rerank_pool: 128 };
+        assert!(store.save_pipeline_config(&bad).is_err());
+    }
+
+    #[test]
     fn v10_migrates_old_defaults_and_preserves_custom_settings() {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::open(&dir.path().join("settings.sqlite")).unwrap();
@@ -2891,7 +3486,7 @@ while [ ! -f "$(dirname "$0")/release" ]; do sleep 0.02; done
         old["retrieval"] = serde_json::json!({"candidate_k":50,"seed_k":10,"max_hops":1,"expansion_term_limit":20,"top_k":10,"chunk_chars":1000});
         store.connection().execute("INSERT INTO preferences VALUES(1,?)", [old.to_string()]).unwrap();
         let upgraded = store.settings().unwrap();
-        assert_eq!(upgraded.retrieval_version, 10);
+        assert_eq!(upgraded.retrieval_version, 11);
         assert_eq!(upgraded.retrieval.candidate_k, 50);
         assert_eq!(upgraded.retrieval.max_hops, 1);
         assert_eq!(upgraded.jev.url, "https://existing.example/decisions");
@@ -2899,6 +3494,38 @@ while [ ! -f "$(dirname "$0")/release" ]; do sleep 0.02; done
         store.connection().execute("UPDATE preferences SET value=? WHERE id=1", [old.to_string()]).unwrap();
         assert_eq!(store.settings().unwrap().retrieval.candidate_k, 70);
         assert_eq!(store.settings().unwrap().retrieval.max_hops, 1);
+    }
+
+    #[test]
+    fn v11_migrates_old_default_weights() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("settings.sqlite")).unwrap();
+        let mut old = serde_json::to_value(Settings::default()).unwrap();
+        old.as_object_mut().unwrap().remove("retrieval_version");
+        old["jev"]["url"] = serde_json::json!("https://existing.example/decisions");
+        old["retrieval"]["keyword_weight"] = serde_json::json!(0.7);
+        old["retrieval"]["vector_weight"] = serde_json::json!(0.3);
+        store.connection().execute("INSERT INTO preferences VALUES(1,?)", [old.to_string()]).unwrap();
+        let upgraded = store.settings().unwrap();
+        assert_eq!(upgraded.retrieval.keyword_weight, 0.8);
+        assert_eq!(upgraded.retrieval.vector_weight, 0.25);
+        assert_eq!(upgraded.retrieval_version, 11);
+        assert_eq!(upgraded.jev.url, "https://existing.example/decisions");
+    }
+
+    #[test]
+    fn v11_preserves_custom_weights() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("settings.sqlite")).unwrap();
+        let mut old = serde_json::to_value(Settings::default()).unwrap();
+        old.as_object_mut().unwrap().remove("retrieval_version");
+        old["retrieval"]["keyword_weight"] = serde_json::json!(0.5);
+        old["retrieval"]["vector_weight"] = serde_json::json!(0.5);
+        store.connection().execute("INSERT INTO preferences VALUES(1,?)", [old.to_string()]).unwrap();
+        let upgraded = store.settings().unwrap();
+        assert_eq!(upgraded.retrieval.keyword_weight, 0.5);
+        assert_eq!(upgraded.retrieval.vector_weight, 0.5);
+        assert_eq!(upgraded.retrieval_version, 11);
     }
 
     #[test]
@@ -4504,5 +5131,54 @@ while [ ! -f "$(dirname "$0")/release" ]; do sleep 0.02; done
         let reopened = Store::open(&path).unwrap();
         assert!(reopened.chunk_count().unwrap() > 0);
         assert_eq!(reopened.roots().unwrap()[0].status, "ready");
+    }
+}
+
+impl Store {
+    pub fn upsert_entity(&self, entity: &crate::entity_graph::GraphEntity) -> Result<i64> {
+        crate::entity_graph::write_entity(&self.connection(), entity)
+    }
+    pub fn upsert_relation(&self, relation: &crate::entity_graph::GraphRelation) -> Result<i64> {
+        crate::entity_graph::write_relation(&self.connection(), relation)
+    }
+    /// Filters combine with AND. Root is the existing local folder scope.
+    pub fn list_entities(&self, document_id: Option<i64>, entity_type: Option<&str>, name: Option<&str>, root: Option<&str>) -> Result<Vec<crate::entity_graph::GraphEntity>> {
+        let db = self.connection();
+        let mut stmt = db.prepare("SELECT e.id,e.document_id,e.name,e.type,e.chunk_id,e.created_at FROM entities e JOIN documents d ON d.id=e.document_id WHERE (?1 IS NULL OR e.document_id=?1) AND (?2 IS NULL OR e.type=?2) AND (?3 IS NULL OR e.name=?3) AND (?4 IS NULL OR d.root=?4) ORDER BY e.id")?;
+        let rows = stmt.query_map(params![document_id,entity_type,name,root], |r| Ok(crate::entity_graph::GraphEntity { id: r.get(0)?, document_id: r.get(1)?, name: r.get(2)?, entity_type: r.get(3)?, chunk_id: r.get(4)?, created_at: r.get(5)? }))?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+    pub fn list_relations(&self, entity_id: Option<i64>, root: Option<&str>) -> Result<Vec<crate::entity_graph::GraphRelation>> {
+        let db = self.connection();
+        let mut stmt = db.prepare("SELECT r.id,r.document_id,r.subject_id,r.relation,r.object_id,r.weight,r.chunk_id,r.created_at FROM relations r JOIN documents d ON d.id=r.document_id WHERE (?1 IS NULL OR r.subject_id=?1 OR r.object_id=?1) AND (?2 IS NULL OR d.root=?2) ORDER BY r.id")?;
+        let rows = stmt.query_map(params![entity_id,root], |r| Ok(crate::entity_graph::GraphRelation { id: r.get(0)?, document_id: r.get(1)?, subject_id: r.get(2)?, relation: r.get(3)?, object_id: r.get(4)?, weight: r.get(5)?, chunk_id: r.get(6)?, created_at: r.get(7)? }))?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+    pub fn delete_entity(&self, id: i64) -> Result<()> {
+        let mut db = self.connection();
+        let tx = db.transaction()?;
+        tx.execute("DELETE FROM graph_extractions WHERE document_id IN (SELECT document_id FROM entities WHERE id=?1)", [id])?;
+        tx.execute("DELETE FROM entities WHERE id=?1", [id])?;
+        tx.commit()?;
+        Ok(())
+    }
+    pub fn delete_relation(&self, id: i64) -> Result<()> {
+        let mut db = self.connection();
+        let tx = db.transaction()?;
+        tx.execute("DELETE FROM graph_extractions WHERE document_id IN (SELECT document_id FROM relations WHERE id=?1)", [id])?;
+        tx.execute("DELETE FROM relations WHERE id=?1", [id])?;
+        tx.commit()?;
+        Ok(())
+    }
+    pub fn delete_document_graph(&self, document_id: i64) -> Result<()> {
+        let mut db = self.connection();
+        let tx = db.transaction()?;
+        tx.execute("DELETE FROM entities WHERE document_id=?1", [document_id])?;
+        tx.execute("DELETE FROM graph_extractions WHERE document_id=?1", [document_id])?;
+        tx.commit()?;
+        Ok(())
+    }
+    pub fn graph_fingerprint_matches(&self, document_id: i64, fingerprint: &str) -> Result<bool> {
+        Ok(self.connection().query_row("SELECT EXISTS(SELECT 1 FROM graph_extractions WHERE document_id=?1 AND fingerprint=?2)", params![document_id, fingerprint], |r| r.get(0))?)
     }
 }

@@ -73,6 +73,10 @@ Markdown、普通文本、RTF、Office、表格、EPUB 与文本型 PDF 默认�
 
 正文切片以约 512 字符为默认目标，保留完整句子；代码保留完整行。超长句子或行允许超过目标。片段保存标题路径，相邻片段保留约 80 字符的句子或行重叠。用户自定义长度保存在检索设置中。HTML 中的 Base64 图片数据排除在索引和词表之外。
 
+按文档形态可换切法：Hierarchy 按标题层级建树，每块保留完整父标题路径（如 `Part 1 > Chapter 3 > Section 2`）；Table 按行切，每块附表头与前后上下文窗口；Presentation 按幻灯片切；ParentChild 用小子块检索、命中后以父块补全上下文。自 2026-11-14 起，默认按文档形态自动选择：`.md`、`.markdown` → Hierarchy；`.csv`、`.tsv`、`.xls`、`.xlsx`、`.ods` → Table；`.ppt`、`.pptx`、`.key`、`.odp` → Presentation；其他文件 → General。逐文档手动覆盖（`set_chunk_method`）始终优先于自动选择。Office、表格等转换后的文档通过转换输出路径解析源文件，沿用源文件的切法。
+
+Hierarchy、Table、Slide（Presentation）和 ParentChild 与 General 使用相同的嵌入资源过滤规则：从块内容、源位置跨度（spans）和行范围中排除 `data:` URI、`<svg>` 块等资源载荷。Table 文档只有表头、没有数据行时，仍生成一个包含表头行的块。
+
 从知识库移除目录只清理索引和接入关系。移除子目录会保存排除状态；再次添加可恢复。原文件始终保留。
 
 ## 检索与问答
@@ -87,11 +91,43 @@ Markdown、普通文本、RTF、Office、表格、EPUB 与文本型 PDF 默认�
 
 问答使用配置中的候选与返回数量；桌面深入搜索使用独立的文件展示上限。CLI 的 `-m` 控制最终输出数量。它们共享底层检索实现。
 
+### 实体图谱
+
+模型从文档中抽取实体与关系（默认实体类型：人物、组织、产品、法规、地点、其他；默认关系：拥有、属于、导致、监管、位于、其他），存入本地 SQLite，可按文档、类型、名称筛选；同一文档的抽取指纹不变时跳过重复抽取。图检索以实体名或向量排序的实体为种子，沿关系扩展，把锚定块作为证据返回。抽取调用回答模型，需要配置模型密钥；图谱视图由界面消费图数据。
+
+### Agent Wiki 页
+
+Agent 可根据主题与检索证据生成结构化 Wiki 页（标题、分节、每事实带引用编号、相关已有页面用 `[[标题]]` 互联），保存为 Markdown 笔记并立即索引，保存后即可检索；删除 Wiki 页会同时清理文件、索引与笔记记录。生成调用回答模型，需要配置模型密钥。
+
 ### 问答与工具
 
 回答模型按需调用内置 `search`、`list`、`read`、`grep` 或配置的外部 MCP 工具。每轮共用上下文预算；工具调用次数默认不限制，也可设置共用上限。工具结果携带稳定来源编号，答案引用对应原文来源。
 
 请求失败、上下文超限、文件变化和索引未就绪均返回明确状态，不静默切换算法。更多协议见[SAG 内置 MCP 工具](https://github.com/Zleap-AI/SAG-Wiki/blob/main/docs/zh-CN/SAG内置MCP工具.md)。
+
+## Stage 3 核心 API
+
+以下能力位于 Rust 核心模块，尚无 UI 或 CLI 入口。
+
+### 重排
+
+`core/src/rerank.rs` 提供 `Reranker` trait；Retrieval 配置中的 `rerank_enabled` 默认 `false`，`rerank_candidate_pool` 默认 128，限制在 64–256。`retrieve_fused_reranked` 对融合结果重排；启用但未配置评分器时明确报错，不会静默保留融合顺序。目前未附带生产用 ONNX 评分器。默认关闭的依据是 Python 实测：`bge-reranker-v2-m3` 对完整 128 块候选池重排得分 3.0/5，对三路 top-50 并集重排为 2.5/5，均低于配额融合 A1 的 4.0/5。
+
+### 可组合流水线
+
+`core/src/pipeline.rs` 定义 Parser → Chunker → Compiler → Indexer 组件，SQLite 的 `pipeline_components`、`pipeline_versions`、`pipeline_configs` 表保存注册、版本与配置。内置 Parser 为 `anydoc`（快）、`docling`（准）；Chunker 为 `general`、`hierarchy`、`table`、`presentation`、`parent-child`；Compiler 为 `fts`（仅 FTS5）、`fts-vector`（FTS + 向量召回）；Indexer 为 `sqlite`。`publish_pipeline` 校验引用组件并递增版本；具名配置保存流水线版本和重排设置，可复用。
+
+### 本地 HTTP 服务
+
+`core/src/http_api.rs` 提供面向编码 Agent、仅监听 `127.0.0.1` 的 HTTP 服务。`GET /health` 返回 `{"status":"ok"}`；`GET /search?q=...&top_k=...` 返回块级 JSON 结果，携带路径及起止行号作为引用位置。数据目录中的 `sag-http.json` 保存端口和 PID，供服务发现。
+
+### 分块管理与元数据
+
+`core/src/chunk_admin.rs` 提供 `list_chunks` 预览、`split_chunk` / `merge_chunks`，以及下一次索引时生效、优先于分块方法的手动边界覆盖 `set_chunk_boundaries`。文档元数据包含作者、日期、来源；`documents_matching_metadata` 筛选文档，`search_with_metadata_filter` 按元数据过滤搜索。
+
+### Agentic 辅助
+
+`core/src/agentic.rs` 提供多轮检索决策层，默认最多 3 轮、证据数量阈值为 5；达到轮数上限、证据足够或无新增证据时停止。`verify_citations` 机械检查 `[N]` 引用，将无效引用标为 `[N?]` 并报告，不判断来源内容是否支持陈述。块增强按需调用 LLM 生成标签、关键词和问题，默认关闭；`search_with_enrichment` 利用已存增强信息扩大召回，没有已存增强信息时与普通搜索一致。
 
 ## 界面与文档显示
 

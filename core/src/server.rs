@@ -205,7 +205,7 @@ async fn serve(
                     let service=service.clone();let write=write.clone();let running=running.clone();let requests=requests.clone();let connection_cancel=cancelled.clone();
                     let sink=EventSink{owner:owner.clone(),request_id:Some(id.clone()),cancel:cancel.clone(),bus:service.events.clone()};
                     jobs.spawn(async move {
-                        let costly=matches!(&operation,Operation::RunQuery{..}|Operation::ExploreGraph{..}|Operation::ExploreNeighbors{..}|Operation::Cli{command:Command::Search{..}|Command::Match(_),..});
+                        let costly=matches!(&operation,Operation::RunQuery{..}|Operation::ExploreGraph{..}|Operation::ExploreNeighbors{..}|Operation::Cli{command:Command::Search{..}|Command::Match(_)|Command::TestRetrieval(_),..});
                         let shutdown=matches!(operation,Operation::Shutdown);
                         let result=async {
                             let _permit=if costly {

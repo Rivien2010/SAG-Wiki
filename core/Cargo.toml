@@ -19,6 +19,10 @@ tempfile = "3"
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
 rusqlite = { version = "0.37", features = ["bundled"] }
+sqlite-vec = "=0.1.9"
+ort = { version = "=2.0.0-rc.15", default-features = false, features = ["load-dynamic", "ndarray"] }
+ndarray = "0.17"
+tokenizers = "=0.21.4"
 notify = "8"
 walkdir = "2"
 sha2 = "0.10"

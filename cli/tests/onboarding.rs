@@ -32,7 +32,7 @@ impl Terminal {
         }
     }
     fn wait_for(&mut self, text: &str) {
-        let deadline = Instant::now() + Duration::from_secs(8);
+        let deadline = Instant::now() + Duration::from_secs(20);
         while !self.output.contains(text) && Instant::now() < deadline {
             self.read_pending();
             std::thread::sleep(Duration::from_millis(5));

@@ -1,3 +1,4 @@
+pub mod retrieval_panel;
 pub mod runtime;
 pub mod mineru;
 mod build;
@@ -13,7 +14,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use types::*;
 
-pub const RETRIEVAL_VERSION: u8 = 10;
+pub const RETRIEVAL_VERSION: u8 = 11;
 pub const BUILD_ID: &str = env!("SAG_BUILD_ID");
 pub const BUILD_CHANNEL: &str = env!("SAG_BUILD_CHANNEL");
 pub const MAX_FRAME: usize = 128 * 1024;

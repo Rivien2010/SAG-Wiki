@@ -39,6 +39,8 @@ pub enum Command {
     Status,
     List,
     Check,
+    TestRetrieval(crate::retrieval_panel::PanelOptions),
+    BackfillVectors,
     Configure {
         #[serde(default)]
         enable: bool,
@@ -168,12 +170,22 @@ pub struct CheckOutput {
     pub indexed_files: usize,
     pub roots: Vec<crate::types::Root>,
 }
+/// Counts of newly written chunk vectors (including content-cache hits).
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VectorIndexOutcome {
+    pub encoded: usize,
+    pub failed: usize,
+    pub skipped_no_model: usize,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "type", content = "data", rename_all = "snake_case")]
 pub enum Response {
     Status(Status),
     Roots(Vec<crate::types::Root>),
     Checked(CheckOutput),
+    RetrievalPanel(crate::retrieval_panel::PanelOutput),
+    VectorsBackfilled(VectorIndexOutcome),
     Configured(crate::types::ModelConfig),
     Added(AddOutput),
     Removed { path: String },

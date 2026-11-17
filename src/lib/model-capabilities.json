@@ -27,6 +27,20 @@
         {"value": "high", "parameters": {"reasoning_effort": "high"}},
         {"value": "max", "parameters": {"reasoning_effort": "max"}}
       ]
+    },
+    {
+      "ids": ["MiniMax-M3"],
+      "hosts": ["api.minimaxi.com"],
+      "source": "https://platform.minimaxi.com/document/ChatCompletion",
+      "context_window": 1048576,
+      "default_parameters": {"temperature": 0.4, "max_tokens": 8000, "thinking": {"type": "disabled"}},
+      "levels": [
+        {"value": "none", "parameters": {"thinking": {"type": "disabled"}}},
+        {"value": "low", "parameters": {"thinking": {"type": "enabled"}}},
+        {"value": "medium", "parameters": {"thinking": {"type": "enabled"}}},
+        {"value": "high", "parameters": {"thinking": {"type": "enabled"}}},
+        {"value": "max", "parameters": {"thinking": {"type": "enabled"}}}
+      ]
     }
   ]
 }

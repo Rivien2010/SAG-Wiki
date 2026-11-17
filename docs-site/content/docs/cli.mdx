@@ -80,7 +80,32 @@ sag uninstall cli
 
 `sag remove` 从知识库移除当前目录，也可指定已添加的根目录或其中的子目录。根目录会取消接入；子目录会清理索引并持久排除，后续扫描和文件监听不会重新加入。全部本地文件保持不变，执行 `sag add 同一子目录` 可恢复并重新索引。目录已移动或磁盘离线时，仍可按原来登记的完整路径移除记录。`--json` 返回移除的目录路径。移除后目录立即从桌面知识库中消失。UI 的文件夹菜单同样提供移除操作；文件设置 → 已移除的子目录中可以恢复。
 
-搜索不需要 `search` 子命令，直接运行 `sag "搜索内容"`。`add`、`remove`、`list`、`check`、`status`、`config`、`service`、`install`、`uninstall` 保留为管理命令。搜索这些字面内容或以 `-` 开头的内容时，用 `--` 分隔，例如 `sag -c -- "status"`。
+搜索不需要 `search` 子命令，直接运行 `sag "搜索内容"`。`add`、`remove`、`list`、`check`、`status`、`config`、`service`、`install`、`uninstall`、`test-retrieval`、`backfill-vectors` 保留为管理命令。搜索这些字面内容或以 `-` 开头的内容时，用 `--` 分隔，例如 `sag -c -- "status"`。
+
+### 回填本地向量
+
+```sh
+sag backfill-vectors
+sag backfill-vectors --json
+```
+
+`sag backfill-vectors` 为当前存储中已索引知识库的缺失块补写 Conan 向量，适用于启用向量写入前已建立的索引。与 `test-retrieval` 一样，已注册目录必须获得授权且索引就绪。命令完全本地运行，不需要 API 密钥或网络；复用准确检索的本地模型发现方式（Hugging Face 缓存中的 `main`），不会下载模型。运行前请在本地安装 Conan 模型与 ONNX Runtime。缺模型时跳过而不报错退出；单块失败会记录日志并继续处理其余块。
+
+当前存储使用无内容 FTS，回填会按已保存的范围/字节跨度和索引内容哈希从本地原文件恢复块文本。原文件不可读或已变更时计为失败，请刷新文本索引后重试。
+
+摘要显示 `encoded`、`failed`、`skipped-no-model` 块数（JSON 字段为 `skipped_no_model`）。`encoded` 表示新写入向量的块数，包含内容缓存命中。可重复运行，仅处理没有向量的块。新增或变更文件也会在文本索引事务提交后补写向量。首次索引对每个未缓存块执行 ONNX 编码；未变内容复用 SHA-256 嵌入缓存，已有向量的块直接跳过模型发现。
+
+### 检索测试面板
+
+```sh
+sag test-retrieval
+sag test-retrieval --mode accurate --top-k 10 --json
+sag test-retrieval --mode fast --keyword-weight 0.6 --vector-weight 0.4 --threshold 0.1 --pool 80
+```
+
+对当前已索引库跑 6 题检索面板，输出每题检索分（0/0.5/1.0）与生成分（0/1），以及总分。Q4 是反幻觉陷阱，单独计分，不计入检索总分（满分 5）。每题一行诊断：`recall-ok-answer-ok`（召回与答案都对）、`recall-ok-answer-bad`（召回对了但答案差，查模型与提示词）、`recall-miss`（召回就没中，查解析、分块与参数）、`recall-ok-answer-unverified`（无生成密钥）。
+
+旋钮 `--mode`（fast/accurate）、`--top-k`、`--keyword-weight`、`--vector-weight`、`--threshold`、`--pool` 只影响本次运行，不持久化；`--json` 输出机器可读结果。检索需要 Jev 密钥（SAG2 评分依赖 Jev），未配置时明确报错；未配置 MiniMax 密钥时生成显示 skipped、总分 unverified，不失败面板。生成分只做机械引用核对（引用是否指向已选证据、是否越界），不判断答案事实是否正确。无索引目录时提示先运行 `sag add`。
 
 默认搜索当前执行目录；位置参数和 `--path` 不能同时使用。默认最多 10 个片段，允许 1–100。`-c` 仅改变输出，不改变召回与排序。路径相对于命令执行目录；JSON 同时返回完整路径、行号、实际范围和截断标记。仅 `-c` 返回 `content`。分离的原文范围分别输出，避免把不连续片段标成连续行。
 

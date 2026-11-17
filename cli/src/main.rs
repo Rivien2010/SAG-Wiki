@@ -125,6 +125,31 @@ enum CliCommand {
         #[arg(long)]
         json: bool,
     },
+    /// Fill missing local Conan vectors for the current indexed library.
+    BackfillVectors {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Run the six-question retrieval panel against the current indexed store.
+    /// Uses existing JEV configuration. MINIMAX_API_KEY or a saved MiniMax
+    /// answer credential enables generation; overrides apply to this run only.
+    TestRetrieval {
+        /// Retrieval mode (default: saved config).
+        #[arg(long, value_parser = ["fast", "accurate"])]
+        mode: Option<String>,
+        #[arg(long)]
+        top_k: Option<usize>,
+        #[arg(long)]
+        keyword_weight: Option<f64>,
+        #[arg(long)]
+        vector_weight: Option<f64>,
+        #[arg(long)]
+        threshold: Option<f64>,
+        #[arg(long)]
+        pool: Option<usize>,
+        #[arg(long)]
+        json: bool,
+    },
     /// 管理独立后台服务。
     Service { #[command(subcommand)] action: ServiceCommand },
     /// 配置检索服务。交互模式下隐藏密钥输入。
@@ -369,6 +394,14 @@ fn run(args: Args, interrupted: Arc<Interrupt>) -> Result<i32> {
     let (command, path, json, timeout) = match args.command {
         Some(CliCommand::Install { .. } | CliCommand::Uninstall { .. } | CliCommand::Service{..}) => unreachable!(),
         Some(CliCommand::Status) => (Command::Status, cwd.clone(), false, 10),
+        Some(CliCommand::TestRetrieval { mode, top_k, keyword_weight, vector_weight, threshold, pool, json }) => (
+            Command::TestRetrieval(sag_protocol::retrieval_panel::PanelOptions {
+                mode: mode.map(|v| if v == "fast" { sag_protocol::types::RetrievalMode::Fast } else { sag_protocol::types::RetrievalMode::Accurate }),
+                top_k, keyword_weight, vector_weight, threshold, pool,
+                minimax_key: std::env::var("MINIMAX_API_KEY").ok().filter(|key| !key.trim().is_empty()),
+            }), cwd.clone(), json, 86400,
+        ),
+        Some(CliCommand::BackfillVectors { json }) => (Command::BackfillVectors, cwd.clone(), json, 86400),
         Some(CliCommand::List { json }) => (Command::List, cwd.clone(), json, 10),
         Some(CliCommand::Check { directory, json }) => (
             Command::Check, cwd.join(directory.unwrap_or_default()), json, 10,
@@ -427,6 +460,8 @@ fn run(args: Args, interrupted: Arc<Interrupt>) -> Result<i32> {
             else if roots.is_empty() { println!("尚未添加索引目录。请在目标目录运行 sag add。"); }
             else { print_roots(&roots); }
         }
+        Response::VectorsBackfilled(output) => println!("{}", render_vector_outcome(&output, json)?),
+        Response::RetrievalPanel(output) => println!("{}", render_panel(&output, json)?),
         Response::Checked(output) => {
             if json { println!("{}", serde_json::to_string(&output)?); }
             else {
@@ -621,4 +656,60 @@ fn run_service(action:&ServiceCommand)->Result<()> {
         } else {println!("SAG 后台服务已停止");}
         Ok(())
     })
+}
+
+fn render_vector_outcome(output: &sag_protocol::VectorIndexOutcome, json: bool) -> Result<String> {
+    if json { return Ok(serde_json::to_string(output)?); }
+    Ok(format!("Vectors: encoded={} failed={} skipped-no-model={}",
+        output.encoded, output.failed, output.skipped_no_model))
+}
+
+fn render_panel(output: &sag_protocol::retrieval_panel::PanelOutput, json: bool) -> Result<String> {
+    if json { return Ok(serde_json::to_string(output)?); }
+    let mut lines = output.notes.clone();
+    lines.push(format!("Effective retrieval config: {}", serde_json::to_string(&output.options)?));
+    for q in &output.questions {
+        lines.push(format!("{} {}\nretrieval: {:.1}; generation: {}; generation score: {}; citations valid/invalid: {}/{}\n{} — {}",
+            q.id, q.question, q.retrieval_score, q.generation,
+            q.generation_score.map(|v| v.to_string()).unwrap_or_else(|| "unverified".into()),
+            q.valid_citations, q.invalid_citations, q.diagnosis, q.advice));
+    }
+    lines.push(format!("retrieval total: {:.1}/5 (Q4 excluded); generation total: {} — {}",
+        output.retrieval_total, output.generation_total.map(|v| format!("{v}/6")).unwrap_or_else(|| "unverified".into()), output.generation_status));
+    Ok(lines.join("\n"))
+}
+
+#[cfg(test)]
+mod panel_tests {
+    use super::*;
+    #[test]
+    fn backfill_vectors_parses_and_json_is_machine_readable() {
+        for (args, json) in [(vec!["sag", "backfill-vectors"], false), (vec!["sag", "backfill-vectors", "--json"], true)] {
+            assert!(matches!(Args::try_parse_from(args).unwrap().command,
+                Some(CliCommand::BackfillVectors { json: actual }) if actual == json));
+        }
+        let output = sag_protocol::VectorIndexOutcome { encoded: 3, failed: 1, skipped_no_model: 2 };
+        let parsed: serde_json::Value = serde_json::from_str(&render_vector_outcome(&output, true).unwrap()).unwrap();
+        assert_eq!(parsed, serde_json::json!({"encoded": 3, "failed": 1, "skipped_no_model": 2}));
+        assert_eq!(render_vector_outcome(&output, false).unwrap(), "Vectors: encoded=3 failed=1 skipped-no-model=2");
+        let response = Response::VectorsBackfilled(output);
+        assert!(matches!(serde_json::from_str::<Response>(&serde_json::to_string(&response).unwrap()).unwrap(), Response::VectorsBackfilled(_)));
+        assert!(matches!(serde_json::from_str::<Command>(&serde_json::to_string(&Command::BackfillVectors).unwrap()).unwrap(), Command::BackfillVectors));
+    }
+
+    #[test]
+    fn test_retrieval_parses_and_json_is_machine_readable() {
+        let args = Args::try_parse_from(["sag", "test-retrieval", "--mode", "accurate", "--top-k", "7", "--keyword-weight", "0.6", "--vector-weight", "0.4", "--threshold", "0.1", "--pool", "80", "--json"]).unwrap();
+        assert!(matches!(args.command, Some(CliCommand::TestRetrieval { top_k: Some(7), pool: Some(80), json: true, .. })));
+        assert!(Args::try_parse_from(["sag", "test-retrieval", "--mode", "invalid"]).is_err());
+        let output = sag_protocol::retrieval_panel::PanelOutput {
+            options: Default::default(), notes: vec!["Q4 excluded".into()], questions: vec![],
+            retrieval_total: 0., retrieval_max: 5, generation_total: None, generation_status: "unverified".into(),
+        };
+        let text = render_panel(&output, true).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(parsed["retrieval_max"], 5);
+        assert!(parsed["generation_total"].is_null());
+        assert_eq!(parsed["generation_status"], "unverified");
+    }
 }

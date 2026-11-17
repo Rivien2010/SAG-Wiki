@@ -117,3 +117,38 @@ Restores the six SAG2 values to `50 / 10 / 20 / 1 / 10 / 512`. Save afterward. I
 The implementation permits at most three Jev scoring rounds. Final local ranking makes no additional model calls. Large candidate sets are batched under request budgets while retaining whole candidates. A single candidate plus shared evidence exceeding the budget produces an explicit error rather than truncating the source.
 
 Retrieval rounds therefore do not equal Jev HTTP request counts. More candidates, seeds or larger chunks can increase batching and time.
+
+## Local Conan embeddings (core integration)
+
+The Rust core now exposes a local Conan ONNX encoder and a top-50 retrieval helper for fusion. This integration does not add desktop controls. It reads the 1792-dimensional `sentence_embedding` output, packs positive values into 224 bytes, and ranks stored chunk vectors by Hamming distance through sqlite-vec. Chunk embeddings use the existing seven-day cache, keyed by text hash and model path/revision. Encoders share a session per model signature; poisoned sessions are discarded before reuse.
+
+Models are not bundled and discovery never downloads them. The core checks the local Hugging Face cache for `onnx-community/Conan-embedding-v1` (`onnx/model_int8.onnx` or `model_int8.onnx`, plus `tokenizer.json`), then an explicitly imported component. Cache location precedence is `HF_HUB_CACHE`, `HF_HOME/hub`, then `~/.cache/huggingface/hub`. The caller supplies a snapshot revision or a local ref such as `main`. A missing model prints a prompt and returns an empty Conan leg so callers can fuse the remaining available legs. WeMM runtime encoding remains outside this integration.
+
+Explicit component import accepts already downloaded streams and trusted size/SHA-256 values. It stages files, verifies them, and atomically installs an immutable revision. Failed verification leaves existing revisions intact. Discovery also verifies imported components; it does not select or overwrite an active model.
+
+ONNX Runtime is loaded dynamically. Set `ORT_DYLIB_PATH` to the native library file. Otherwise the core searches beside the executable, its `lib` directory, platform library directories from `LD_LIBRARY_PATH` (Linux), `DYLD_LIBRARY_PATH` (macOS), or `PATH` (Windows), then `/usr/local/lib` and `/usr/lib` on Unix. Native libraries come from the [Microsoft ONNX Runtime 1.31.0 release](https://github.com/microsoft/onnxruntime/releases/tag/v1.31.0): Linux x86_64 uses `onnxruntime-linux-x64-1.31.0.tgz`; macOS and Windows require the archive matching their platform and architecture. Linux expects `libonnxruntime.so`, macOS `libonnxruntime.dylib`, and Windows `onnxruntime.dll`. The x86_64 prebuilt runtime requires AVX2; older CPUs can terminate with an illegal instruction. macOS/Windows native loading is **unvalidated (未验证)**.
+
+The six-question comparison against the existing Python bf16 chunk vectors: with the local int8 ONNX artifact, Q1–Q6 top-50 set overlaps are respectively **47, 49, 47, 48, 48, 49 out of 50**; the differences come from int8 quantisation numerics (about 33/1792 bits flipped), not a Rust implementation bug. The acceptance standard is fused top-10 evidence coverage matching the Python leg, with the retrieval score staying at 4.0/5: measured evidence sets match exactly for Q1/Q3/Q4/Q5/Q6, Q2 differs by one boundary chunk but still scores 1.0, for a total of 4.0/5. The regression test asserts this standard.
+
+Before changing model handles, the public compatibility check compares corresponding text/float-vector samples. Dimensions must agree and mean cosine similarity must be at least 0.9. A failed check leaves the current handle in place; it never rewrites stored vectors or automatically re-embeds chunks. Empty samples, zero vectors, and non-finite values are rejected. Packed binary vectors cannot substitute for float samples in this check.
+
+## Fast/accurate retrieval and multi-leg fusion
+
+Retrieval has two tiers (retrieval config `mode`, default fast).
+
+- **Fast**: SAG2 leg only — the existing deep-search behaviour, unchanged.
+- **Accurate**: SAG2 and vector legs run in parallel (Conan; when the WeMM model is missing it falls back to the Conan + SAG2 two-leg setup), each contributing top-50, fused with RRF (k=60) plus a per-author top-5 quota, taking the final top-10. Six-question retrieval score: 4.5/5.
+
+**Graceful degradation**: if any leg fails (missing model, vector table not built, ONNX load failure), retrieval falls back to the available legs without interrupting; a missing model never triggers a download.
+
+**Retrieval knobs** (retrieval config): keyword/vector weights default 0.8/0.25, similarity threshold 0.2, candidate pool 50; fusion parameters RRF k=60, per-author quota 5, per-leg top-50, final top-10. Existing libraries automatically migrate the old default 0.7/0.3 to 0.8/0.25 on first open; custom weights are unaffected.
+
+**Literal exact match**: retrieval has an additional literal-match leg that finds buried numbers, names and other exact content, running alongside BM25; its hits join the candidate pool before fusion.
+
+**Folder weights**: each folder can carry a weight (default 1.0) that joins the hybrid score, so higher-weight folder content ranks first on ties.
+
+**Dual-tier parsing**: parsing has fast and accurate tiers. Fast uses lightweight text extraction; accurate adds layout and table recognition (Docling) after extraction, so table content becomes retrievable.
+
+**Incremental sync**: bulk import resumes from a checkpoint, so an interrupted import does not redo finished files; deleting a file removes its chunks from the full-text and vector indexes, so it is no longer retrievable.
+
+**Index parallelism**: Settings → Files → Index parallelism, default 8, range 1–64; takes effect on the next indexing task and does not rebuild existing indexes. Bulk indexing uses a bounded worker pool with a memory-budget backpressure so a large import does not exhaust memory.

@@ -81,7 +81,32 @@ sag uninstall cli
 
 `sag remove` removes the current directory, a registered root or a subdirectory from the knowledge base. Roots are unregistered. Subdirectories have their indexes cleared and remain excluded from later scans and file watching. All local files remain unchanged. Running `sag add` for the same subdirectory restores and reindexes it. If a directory moved or its disk is offline, remove its record using the original registered absolute path. `--json` returns the removed directory path. The directory disappears immediately from desktop's knowledge base. The UI folder menu provides the same removal action; **File settings → Removed subdirectories** allows restoration.
 
-Search requires no `search` subcommand: run `sag "search query"` directly. `add`, `remove`, `list`, `check`, `status`, `config`, `service`, `install` and `uninstall` are reserved management commands. Use `--` when searching those literal words or queries beginning with `-`, for example `sag -c -- "status"`.
+Search requires no `search` subcommand: run `sag "search query"` directly. `add`, `remove`, `list`, `check`, `status`, `config`, `service`, `install`, `uninstall`, `test-retrieval` and `backfill-vectors` are reserved management commands. Use `--` when searching those literal words or queries beginning with `-`, for example `sag -c -- "status"`.
+
+### Backfill local vectors
+
+```sh
+sag backfill-vectors
+sag backfill-vectors --json
+```
+
+`sag backfill-vectors` fills missing Conan vectors across the current store's indexed library, including files indexed before vector writing was enabled. Registered roots must be authorized and ready, as with `test-retrieval`. The command is local and needs no API key or network. It uses the same local model discovery as accurate retrieval (`main` in the Hugging Face cache); it never downloads a model. Install the Conan model and ONNX Runtime locally before running it. Missing models skip chunks without failing; chunk failures are logged and the remaining chunks continue.
+
+Current stores use contentless FTS, so backfill reads chunk text from local source files using the stored ranges/spans and indexed content hash. Unreadable or changed sources count as failures; refresh the text index and retry.
+
+The summary reports `encoded`, `failed` and `skipped-no-model` chunk counts (`skipped_no_model` in JSON). `encoded` counts newly written vectors, including content-cache hits. Re-running processes only chunks without vectors. New or changed files also receive vectors after their text-index transaction commits. The first index runs ONNX for each uncached chunk; unchanged content reuses the SHA-256 embedding cache, and chunks already holding vectors skip model discovery entirely.
+
+### Retrieval test panel
+
+```sh
+sag test-retrieval
+sag test-retrieval --mode accurate --top-k 10 --json
+sag test-retrieval --mode fast --keyword-weight 0.6 --vector-weight 0.4 --threshold 0.1 --pool 80
+```
+
+Runs a six-question retrieval panel against the currently indexed library, printing a per-question retrieval score (0/0.5/1.0) and generation score (0/1), plus totals. Q4 is a hallucination trap, scored separately and excluded from the retrieval total (out of 5). Each question gets one diagnosis line: `recall-ok-answer-ok` (recall and answer both right), `recall-ok-answer-bad` (recall right but answer wrong — check the model and prompt), `recall-miss` (recall never hit — check parsing, chunking and parameters), or `recall-ok-answer-unverified` (no generation key).
+
+The `--mode` (fast/accurate), `--top-k`, `--keyword-weight`, `--vector-weight`, `--threshold` and `--pool` overrides apply to this run only and are not persisted; `--json` prints machine-readable output. Retrieval requires a Jev key (SAG2 scoring depends on Jev) and fails with a clear error without one; without a MiniMax key, generation shows skipped and the total unverified, without failing the panel. The generation score is only a mechanical citation check (whether citations point at the selected evidence and stay in range); it does not judge whether the answer is factually correct. With no indexed directory, the command asks you to run `sag add` first.
 
 Search defaults to the current working directory. A positional path and `--path` cannot be combined. The default result limit is 10 chunks, with 1–100 allowed. `-c` changes output only, without changing recall or ranking. Paths resolve relative to the command's working directory. JSON includes absolute paths, line numbers, actual ranges and truncation flags. Only `-c` returns `content`. Separate source ranges are output separately, so discontinuous chunks are not represented as continuous lines.
 

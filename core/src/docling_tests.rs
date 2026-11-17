@@ -2215,3 +2215,14 @@ fn cancelling_an_offline_uv_check_reports_cancellation_and_leaves_no_uv() {
         .filter(|e| e.file_name().to_string_lossy().starts_with(".tmp")).collect();
     assert!(leftovers.is_empty(), "temporary uv copy was left behind");
 }
+
+#[test]
+fn converted_output_path_round_trips_to_its_source() {
+    let root = Path::new("/kb");
+    let source = root.join("nested/table.csv");
+    let output = output_path(root, &source).unwrap();
+    assert_eq!(output, Path::new("/kb/.sag-converted/nested/table.csv.md"));
+    assert_eq!(source_path_from_output(&output).unwrap(), source);
+    assert_eq!(source_path_from_output(&source), None);
+    assert_eq!(source_path_from_output(Path::new("/kb/guide.md")), None);
+}

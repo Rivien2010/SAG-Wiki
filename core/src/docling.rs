@@ -1617,8 +1617,7 @@ pub fn fingerprint(path: &Path) -> Result<String> {
     Ok(format!("{:x}", hash.finalize()))
 }
 
-pub fn output_path(root: &Path, source: &Path) -> Result<PathBuf> {
-    let relative = source.strip_prefix(root)?;
+pub fn output_path(root: &Path, source: &Path) -> Result<PathBuf> {    let relative = source.strip_prefix(root)?;
     if relative
         .components()
         .any(|part| !matches!(part, std::path::Component::Normal(_)))
@@ -1640,6 +1639,29 @@ pub fn output_path(root: &Path, source: &Path) -> Result<PathBuf> {
         }
     }
     Ok(output)
+}
+
+/// Reverse of `output_path`: derive the source file from a converted
+/// document path (`root/.sag-converted/<rel>/<name>.md` ->
+/// `root/<rel>/<name>`). Returns `None` when the path is not a converted
+/// output. Used to inherit per-document settings (e.g. the chunking
+/// method) from the source: the conversions row is written only after the
+/// converted file is chunked, so the database cannot answer this yet.
+pub fn source_path_from_output(path: &Path) -> Option<PathBuf> {
+    let mut root = None;
+    for ancestor in path.ancestors() {
+        if ancestor.file_name().is_some_and(|name| name == OUTPUT_DIRECTORY) {
+            root = ancestor.parent();
+            break;
+        }
+    }
+    let root = root?;
+    let relative = path.strip_prefix(root.join(OUTPUT_DIRECTORY)).ok()?;
+    let mut source = root.join(relative);
+    let name = source.file_name()?.to_str()?.to_string();
+    let stripped = name.strip_suffix(".md")?.to_string();
+    source.set_file_name(stripped);
+    Some(source)
 }
 
 #[cfg(test)]

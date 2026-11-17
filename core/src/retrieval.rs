@@ -163,6 +163,24 @@ pub fn interleave(lists: Vec<Vec<Candidate>>, limit: usize) -> Vec<Candidate> {
     }
     result
 }
+pub(crate) fn validate_knobs(config: &crate::stage_config::StageConfig) -> Result<()> {
+    if !config.keyword_weight.is_finite() || config.keyword_weight < 0.
+        || !config.vector_weight.is_finite() || config.vector_weight < 0.
+        || !config.similarity_threshold.is_finite() || !(0.0..=1.0).contains(&config.similarity_threshold) {
+        bail!("检索权重须为有限非负数，相似度阈值须为 0–1")
+    }
+    if config.rerank_candidate_pool < config.rerank_candidate_pool_min
+        || config.rerank_candidate_pool > config.rerank_candidate_pool_max {
+        bail!("重排候选池须为 64–256")
+    }
+    Ok(())
+}
+
+/// Exact literal hits retain store match order; BM25 remains a separate leg.
+pub fn grep_leg(store: &Store, query: &str, scope: &[String], references: &[String], limit: usize) -> Result<Vec<i64>> {
+    Ok(store.literal_candidates(query, scope, references, limit)?.into_iter().map(|c| c.id).collect())
+}
+
 fn rank(mut candidates: Vec<Candidate>) -> Vec<Candidate> {
     candidates.sort_by(|a, b| {
         b.score
@@ -193,7 +211,7 @@ where
 {
     let mut options = options.clone();
     options.candidate_k = 100;
-    retrieve_inner(store, query, scope, &[], &options, cancel, Some(100), score, progress).await
+    retrieve_inner(store, query, scope, &[], &options, cancel, Some(100), true, score, progress).await
 }
 pub async fn retrieve<F, Fut>(
     store: &Store,
@@ -209,8 +227,153 @@ where
     F: FnMut(Vec<Candidate>, Vec<Candidate>) -> Fut,
     Fut: Future<Output = Result<Vec<Candidate>>>,
 {
-    retrieve_inner(store, query, scope, references, options, cancel, None, score, progress).await
+    retrieve_inner(store, query, scope, references, options, cancel, None, true, score, progress).await
 }
+/// Mode-aware entry point for callers supplying ranked vector hits. Vector
+/// legs must already reflect the enabled models; missing models supply no leg.
+/// Fast mode and accurate mode without vector legs use configured SAG2 retrieval.
+pub async fn retrieve_fused<F, Fut>(
+    store: &Store,
+    query: &str,
+    scope: &[String],
+    references: &[String],
+    options: &Retrieval,
+    vector_legs: &[Vec<i64>],
+    cancel: &CancellationToken,
+    score: F,
+    progress: impl Fn(&str, usize),
+) -> Result<SearchOutput>
+where
+    F: FnMut(Vec<Candidate>, Vec<Candidate>) -> Fut,
+    Fut: Future<Output = Result<Vec<Candidate>>>,
+{
+    if options.mode == crate::types::RetrievalMode::Fast || vector_legs.is_empty() {
+        return retrieve(store, query, scope, references, options, cancel, score, progress).await;
+    }
+    let config = crate::stage_config::StageConfig::from_retrieval(options);
+    validate_knobs(&config)?;
+    let mut sag_options = options.clone();
+    sag_options.top_k = config.top_k_per_leg;
+    let sag = retrieve_inner(store, query, scope, references, &sag_options, cancel, None, false, score, &progress).await;
+    let mut output = match sag {
+        Ok(output) => output,
+        Err(error) => {
+            // Cancellation remains an explicit stop, never a reason to continue.
+            if cancel.is_cancelled() { return Err(error); }
+            progress("SAG2 检索不可用，使用其余检索结果", 0);
+            SearchOutput { results: vec![], trace: vec![] }
+        }
+    };
+    let mut legs = Vec::new();
+    let mut weights = Vec::new();
+    if !output.results.is_empty() {
+        legs.push(output.results.iter().map(|c| c.id).collect());
+        weights.push(config.keyword_weight);
+    }
+    let mut candidates: HashMap<i64, Candidate> = output.results.drain(..).map(|c| (c.id, c)).collect();
+    let mut resolved: HashSet<i64> = candidates.keys().copied().collect();
+    let vector_count = vector_legs.iter().filter(|leg| !leg.is_empty()).count();
+    for leg in vector_legs.iter().filter(|leg| !leg.is_empty()) {
+        let mut available = Vec::new();
+        let mut seen = HashSet::new();
+        for &id in leg.iter().take(config.top_k_per_leg.min(config.candidate_pool)) {
+            if cancel.is_cancelled() { bail!("已停止") }
+            if !seen.insert(id) { continue; }
+            if resolved.insert(id) {
+                // Deleted, stale, unreadable, or out-of-scope hits are skipped
+                // when materializing results; preserve the leg's original ranks.
+                if let Ok(Some(candidate)) = store.candidate_by_id(id, scope, references) {
+                    candidates.insert(id, candidate);
+                }
+            }
+            available.push(id);
+        }
+        if !available.is_empty() { legs.push(available); weights.push(config.vector_weight / vector_count as f64); }
+    }
+    // Variant BM25 legs recall vocabulary-mismatched evidence the main legs miss.
+    for variant in &options.variant_queries {
+        let hits = store.candidate_query(&match_query(variant), None, scope, references, &[],
+            config.top_k_per_leg.min(config.candidate_pool))?;
+        let mut available = Vec::new();
+        let mut seen = HashSet::new();
+        for hit in hits {
+            if cancel.is_cancelled() { bail!("已停止") }
+            let id = hit.id;
+            if !seen.insert(id) { continue; }
+            if resolved.insert(id) {
+                // Keep original ranks even when a hit cannot be materialized.
+                if let Ok(Some(candidate)) = store.candidate_by_id(id, scope, references) {
+                    candidates.insert(id, candidate);
+                }
+            }
+            available.push(id);
+        }
+        if !available.is_empty() { legs.push(available); weights.push(config.keyword_weight); }
+    }
+    if cancel.is_cancelled() { bail!("已停止") }
+    // Normalize reciprocal ranks to [0,1] before applying the confidence
+    // threshold. Weights are shared across active vector legs; unavailable
+    // legs do not suppress the confidence of the remaining legs.
+    let total_weight: f64 = weights.iter().sum();
+    let mut scores = IndexMap::<i64, f64>::new();
+    for (leg, weight) in legs.iter().zip(weights) {
+        let mut unique = HashSet::new();
+        for (rank, id) in leg.iter().enumerate() {
+            if candidates.contains_key(id) && unique.insert(*id) && total_weight > 0. {
+                *scores.entry(*id).or_default() += weight / total_weight
+                    * (config.rrf_k as f64 + 1.) / (config.rrf_k as f64 + rank as f64 + 1.);
+            }
+        }
+    }
+    let mut ranked: Vec<_> = scores.into_iter().filter(|(_, confidence)| *confidence > config.similarity_threshold).collect();
+    // Dataset PageRank is multiplicative: 1.0 preserves the hybrid score.
+    // Apply it before the pool/quota/top-N cutoff, after confidence filtering.
+    for (id, score) in &mut ranked {
+        *score *= store.document_weight(candidates[id].document_id)?;
+    }
+    ranked.sort_by(|a, b| b.1.total_cmp(&a.1));
+    ranked.truncate(config.candidate_pool);
+    let mut groups = HashMap::<String, usize>::new();
+    output.results = ranked.into_iter().filter_map(|(id, confidence)| {
+        let candidate = candidates.get_mut(&id)?;
+        let count = groups.entry(crate::models::source_author(&candidate.title, &candidate.heading)).or_default();
+        if *count >= config.quota_per_author { return None; }
+        *count += 1;
+        candidate.score = confidence;
+        Some(candidate.clone())
+    }).take(config.top_k_final).enumerate().map(|(order, mut candidate)| {
+        candidate.order = order;
+        candidate
+    }).collect();
+    Ok(output)
+}
+
+/// Fusion retrieval with the optional rerank stage (Stage 3, 11.1).
+/// Same as `retrieve_fused`, then `rerank::apply_rerank` when the config
+/// enables it. `reranker` is `None` when no rerank model is configured;
+/// with reranking off (the default) the scorer is never consulted and the
+/// result is identical to `retrieve_fused`.
+pub async fn retrieve_fused_reranked<F, Fut>(
+    store: &Store,
+    query: &str,
+    scope: &[String],
+    references: &[String],
+    options: &Retrieval,
+    vector_legs: &[Vec<i64>],
+    cancel: &CancellationToken,
+    score: F,
+    progress: impl Fn(&str, usize),
+    reranker: Option<&dyn crate::rerank::Reranker>,
+) -> Result<SearchOutput>
+where
+    F: FnMut(Vec<Candidate>, Vec<Candidate>) -> Fut,
+    Fut: Future<Output = Result<Vec<Candidate>>>,
+{
+    let output = retrieve_fused(store, query, scope, references, options, vector_legs, cancel, score, progress).await?;
+    let config = crate::stage_config::StageConfig::from_retrieval(options);
+    crate::rerank::apply_rerank(query, output, &config, reranker)
+}
+
 async fn retrieve_inner<F, Fut>(
     store: &Store,
     query: &str,
@@ -219,6 +382,7 @@ async fn retrieve_inner<F, Fut>(
     options: &Retrieval,
     cancel: &CancellationToken,
     file_limit: Option<usize>,
+    dataset_prior: bool,
     mut score: F,
     progress: impl Fn(&str, usize),
 ) -> Result<SearchOutput>
@@ -226,6 +390,8 @@ where
     F: FnMut(Vec<Candidate>, Vec<Candidate>) -> Fut,
     Fut: Future<Output = Result<Vec<Candidate>>>,
 {
+    let config = crate::stage_config::StageConfig::from_retrieval(options);
+    validate_knobs(&config)?;
     let version = store.version()?;
     if options.max_hops > 2 { bail!("SAG2 V10 最多扩展两轮") }
     if cancel.is_cancelled() { bail!("已停止") }
@@ -282,14 +448,20 @@ where
         let excluded: Vec<i64> = seen.iter().copied().collect();
         corpus.resolve_terms(store, &mut terms, scope, references, &excluded)?;
         let candidates = if hop == 0 {
-            let hits = store.candidate_query(
+            let mut hits = store.candidate_query(
                 &expression,
                 None,
                 scope,
                 references,
                 &excluded,
-                options.candidate_k,
+                config.candidate_pool,
             )?;
+            let known: HashSet<_> = hits.iter().map(|c| c.id).collect();
+            let literal: Vec<_> = store.literal_candidates(query, scope, references, config.candidate_pool)?
+                .into_iter().filter(|c| !known.contains(&c.id)).collect();
+            if !literal.is_empty() {
+                hits = interleave(vec![literal, hits], config.candidate_pool);
+            }
             for c in hits.iter().take(5) {
                 protected.insert(c.id, c.clone());
             }
@@ -297,7 +469,7 @@ where
                 hits
             } else {
                 let mut combined = IndexMap::new();
-                for c in store.reference_candidates(references, options.candidate_k)? {
+                for c in store.reference_candidates(references, config.candidate_pool)? {
                     combined.insert(c.id, c);
                 }
                 for c in hits {
@@ -305,7 +477,7 @@ where
                 }
                 combined
                     .into_values()
-                    .take(options.candidate_k)
+                    .take(config.candidate_pool)
                     .enumerate()
                     .map(|(i, mut c)| {
                         c.order = i;
@@ -329,9 +501,9 @@ where
                 scope,
                 references,
                 &excluded,
-                options.candidate_k,
+                config.candidate_pool,
             )?;
-            interleave(lists, options.candidate_k)
+            interleave(lists, config.candidate_pool)
         };
         if candidates.is_empty() {
             break;
@@ -392,18 +564,43 @@ where
         expanded.extend(frontier.iter().map(|c| c.id));
     }
     corpus.diversify(&mut retained);
+    // Keep the default SAG2 diversity order; a non-default dataset prior
+    // deliberately reorders candidates before truncation.
+    let best = retained.iter().map(|c| c.score).fold(0., f64::max);
+    let confidence: HashMap<_, _> = retained.iter().map(|c| (c.id, if best > 0. { c.score / best } else { 0. })).collect();
+    let mut weighted = false;
+    for candidate in &mut retained {
+        let weight = if dataset_prior { store.document_weight(candidate.document_id)? } else { 1. };
+        weighted |= weight != 1.;
+        candidate.score *= weight;
+    }
+    if weighted { retained = rank(retained); }
     if let Some(limit) = file_limit {
         // The deep-search list also retains already scored matches after the V10 result.
         // This keeps file browsing coverage without another model request.
         let current: HashSet<_> = retained.iter().map(|c| c.id).collect();
-        retained.extend(rank(latest.into_values().filter(|c| !current.contains(&c.id)).collect()));
+        let mut additional = rank(latest.into_values().filter(|c| !current.contains(&c.id)).collect());
+        if dataset_prior {
+            for candidate in &mut additional {
+                let weight = store.document_weight(candidate.document_id)?;
+                weighted |= weight != 1.;
+                candidate.score *= weight;
+            }
+        }
+        retained.extend(additional);
+        if weighted { retained = rank(retained); }
         let mut files = HashSet::new();
         retained.retain(|candidate| {
             files.contains(&candidate.path)
                 || (files.len() < limit && files.insert(candidate.path.clone()))
         });
     } else {
-        retained.truncate(options.top_k.min(options.candidate_k));
+        // SAG2 relevance has no fixed scale. Use confidence relative to the
+        // best result for filtering; retain its score scale for diversification.
+        retained.retain(|c| config.keyword_weight > 0.
+            && confidence[&c.id] > config.similarity_threshold);
+        for c in &mut retained { c.score *= config.keyword_weight; }
+        retained.truncate(options.top_k.min(config.candidate_pool));
     }
     Ok(SearchOutput {
         results: retained,
@@ -432,6 +629,170 @@ mod tests {
             hash: String::new(),
         }
     }
+    #[tokio::test]
+    async fn dataset_weight_prioritizes_ties_before_final_cutoff() {
+        let dir = tempfile::tempdir().unwrap();
+        let database = dir.path().join("index.sqlite");
+        let store = Store::open(&database).unwrap();
+        let mut roots = vec![];
+        for folder in ["low", "high"] {
+            let path = dir.path().join(folder);
+            std::fs::create_dir(&path).unwrap();
+            std::fs::write(path.join("same.txt"), "nebula evidence").unwrap();
+            let root = store.add_root(&path).unwrap();
+            assert_eq!(store.root_weight(&root).unwrap(), 1.);
+            store.scan(&root, |_| {}).unwrap();
+            roots.push(root);
+        }
+        let hits = store.candidate_query(&match_query("nebula"), None, &[], &[], &[], 10).unwrap();
+        assert_eq!(hits.len(), 2);
+        assert_eq!(hits[0].bm25, hits[1].bm25);
+        let high = hits.iter().find(|c| c.path.starts_with(&roots[1])).unwrap().id;
+        store.set_root_weight(&roots[1], 2.).unwrap();
+        assert!(store.set_root_weight(&roots[0], f64::NAN).is_err());
+        drop(store);
+        let store = Store::open(&database).unwrap();
+        assert_eq!(store.root_weight(&roots[1]).unwrap(), 2.);
+        async fn score(mut rows: Vec<Candidate>, _: Vec<Candidate>) -> Result<Vec<Candidate>> {
+            for row in &mut rows { row.score = 0.9; }
+            Ok(rows)
+        }
+        let mut options = Retrieval { max_hops: 0, top_k: 1, top_k_final: 1,
+            keyword_weight: 0.5, vector_weight: 0.5, ..Default::default() };
+        let cancel = CancellationToken::new();
+        let fast = retrieve(&store, "nebula", &[], &[], &options, &cancel, score, |_, _| {}).await.unwrap();
+        assert_eq!(fast.results[0].id, high);
+        // Opposite equally weighted lists give both chunks equal RRF scores.
+        options.mode = crate::types::RetrievalMode::Accurate;
+        store.set_root_weight(&roots[1], 1.).unwrap();
+        let unweighted = retrieve_fused(&store, "nebula", &[], &[], &options,
+            &[vec![hits[1].id, hits[0].id]], &cancel, score, |_, _| {}).await.unwrap();
+        store.set_root_weight(&roots[1], 2.).unwrap();
+        let weighted = retrieve_fused(&store, "nebula", &[], &[], &options,
+            &[vec![hits[1].id, hits[0].id]], &cancel, score, |_, _| {}).await.unwrap();
+        assert_ne!(unweighted.results[0].id, high);
+        assert_eq!(weighted.results[0].id, high);
+    }
+
+    #[tokio::test]
+    async fn configured_weights_threshold_and_pool_change_retrieval() {
+        let dir = tempfile::tempdir().unwrap();
+        let files = dir.path().join("files");
+        std::fs::create_dir(&files).unwrap();
+        std::fs::write(files.join("lexical.txt"), "nebula evidence").unwrap();
+        std::fs::write(files.join("vector.txt"), "quasar evidence").unwrap();
+        let store = Store::open(&dir.path().join("index.sqlite")).unwrap();
+        let root = store.add_root(&files).unwrap();
+        store.scan(&root, |_| {}).unwrap();
+        let vector = store.candidate_query(&match_query("quasar"), None, &[], &[], &[], 1).unwrap()[0].id;
+        let legs = vec![vec![vector]];
+        let cancel = CancellationToken::new();
+        async fn score(mut rows: Vec<Candidate>, _: Vec<Candidate>) -> Result<Vec<Candidate>> {
+            for row in &mut rows { row.score = 0.9; }
+            Ok(rows)
+        }
+        let mut options = Retrieval { mode: crate::types::RetrievalMode::Accurate, max_hops: 0, similarity_threshold: 0., ..Default::default() };
+        let lexical = retrieve_fused(&store, "nebula", &[], &[], &options, &legs, &cancel, score, |_, _| {}).await.unwrap();
+        assert_eq!(lexical.results.len(), 2);
+        assert_ne!(lexical.results[0].id, vector);
+        options.keyword_weight = 0.1;
+        options.vector_weight = 0.9;
+        let semantic = retrieve_fused(&store, "nebula", &[], &[], &options, &legs, &cancel, score, |_, _| {}).await.unwrap();
+        assert_eq!(semantic.results[0].id, vector);
+        options.candidate_k = 1;
+        let limited = retrieve_fused(&store, "nebula", &[], &[], &options, &legs, &cancel, score, |_, _| {}).await.unwrap();
+        assert_eq!(limited.results.len(), 1);
+        assert_eq!(limited.results[0].id, vector);
+        for mode in [crate::types::RetrievalMode::Fast, crate::types::RetrievalMode::Accurate] {
+            options.mode = mode;
+            options.similarity_threshold = 1.;
+            assert!(retrieve_fused(&store, "nebula", &[], &[], &options, &legs, &cancel, score, |_, _| {}).await.unwrap().results.is_empty());
+            options.similarity_threshold = 0.;
+            assert!(!retrieve_fused(&store, "nebula", &[], &[], &options, &legs, &cancel, score, |_, _| {}).await.unwrap().results.is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn fused_retrieval_quota_is_shared_across_documents_by_author() {
+        let dir = tempfile::tempdir().unwrap();
+        let files = dir.path().join("files");
+        std::fs::create_dir(&files).unwrap();
+        for name in ["Author-first.md", "Author-second.md"] {
+            let content = (0..6).map(|i| format!("# Section {i}\n\n{}\n\n", "nebula evidence ".repeat(40)))
+                .collect::<String>();
+            std::fs::write(files.join(name), content).unwrap();
+        }
+        let store = Store::open(&dir.path().join("index.sqlite")).unwrap();
+        let root = store.add_root(&files).unwrap();
+        store.scan(&root, |_| {}).unwrap();
+        let hits = store.candidate_query(&match_query("nebula"), None, &[], &[], &[], 50).unwrap();
+        let documents: HashSet<_> = hits.iter().map(|c| c.document_id).collect();
+        assert_eq!(documents.len(), 2);
+        for document in documents {
+            assert!(hits.iter().filter(|c| c.document_id == document).count() >= 5);
+        }
+        assert!(hits.iter().all(|c| crate::models::source_author(&c.title, &c.heading) == "Author"));
+        let vectors = vec![hits.iter().map(|c| c.id).collect()];
+        let options = Retrieval { mode: crate::types::RetrievalMode::Accurate, max_hops: 0, ..Default::default() };
+        let found = retrieve_fused(&store, "", &[], &[], &options, &vectors, &CancellationToken::new(),
+            |rows, _| async { Ok(rows) }, |_, _| {}).await.unwrap();
+        assert_eq!(found.results.len(), 5);
+    }
+
+    #[tokio::test]
+    async fn fused_retrieval_variant_recalls_evidence_missed_by_main_legs() {
+        let dir = tempfile::tempdir().unwrap();
+        let files = dir.path().join("files");
+        std::fs::create_dir(&files).unwrap();
+        std::fs::write(files.join("main.txt"), "nebula evidence").unwrap();
+        std::fs::write(files.join("variant.txt"), "quasar testimony").unwrap();
+        let store = Store::open(&dir.path().join("index.sqlite")).unwrap();
+        let root = store.add_root(&files).unwrap();
+        store.scan(&root, |_| {}).unwrap();
+        let main = store.candidate_query(&match_query("nebula"), None, &[], &[], &[], 1).unwrap()[0].id;
+        let variant = store.candidate_query(&match_query("quasar"), None, &[], &[], &[], 1).unwrap()[0].id;
+        let vectors = vec![vec![main]];
+        let mut options = Retrieval { mode: crate::types::RetrievalMode::Accurate, max_hops: 0, ..Default::default() };
+        let cancel = CancellationToken::new();
+        async fn score(mut rows: Vec<Candidate>, _: Vec<Candidate>) -> Result<Vec<Candidate>> {
+            for row in &mut rows { row.score = 0.9; }
+            Ok(rows)
+        }
+        let baseline = retrieve_fused(&store, "nebula", &[], &[], &options, &vectors, &cancel, score, |_, _| {}).await.unwrap();
+        assert!(!baseline.results.iter().any(|c| c.id == variant));
+        options.variant_queries = vec!["quasar".into()];
+        let expanded = retrieve_fused(&store, "nebula", &[], &[], &options, &vectors, &cancel, score, |_, _| {}).await.unwrap();
+        assert!(expanded.results.iter().take(10).any(|c| c.id == variant));
+    }
+
+    #[tokio::test]
+    async fn literal_leg_recovers_buried_number_outside_bm25_pool() {
+        let dir = tempfile::tempdir().unwrap();
+        let files = dir.path().join("files");
+        std::fs::create_dir(&files).unwrap();
+        let buried = files.join("buried.txt");
+        std::fs::write(&buried, format!("{} 40天", "background ".repeat(500))).unwrap();
+        let short = files.join("short.txt");
+        std::fs::write(&short, "40天 40天 40天").unwrap();
+        let store = Store::open(&dir.path().join("index.sqlite")).unwrap();
+        let root = store.add_root(&files).unwrap();
+        store.index_file(&root, &buried, 20000).unwrap();
+        store.index_file(&root, &short, 20000).unwrap();
+        let bm25 = store.candidate_query(&match_query("40天"), None, &[], &[], &[], 1).unwrap();
+        assert_eq!(bm25[0].path, short.to_str().unwrap());
+        let exact = grep_leg(&store, "40天", &[], &[], 1).unwrap();
+        assert_ne!(exact[0], bm25[0].id);
+        let output = retrieve(&store, "40天", &[], &[],
+            &Retrieval { candidate_k: 1, max_hops: 0, ..Default::default() },
+            &CancellationToken::new(), |mut candidates, _| async move {
+                for c in &mut candidates { c.score = 0.9; }
+                Ok(candidates)
+            }, |_, _| {}).await.unwrap();
+        assert_eq!(output.results[0].id, exact[0]);
+        assert!(grep_leg(&store, "40.*天", &[], &[], 10).unwrap().is_empty());
+        assert!(grep_leg(&store, "40天", &[files.join("other").to_string_lossy().into()], &[], 10).unwrap().is_empty());
+    }
+
     #[test]
     fn sentence_boundaries_preserve_english_initials_and_split_chinese() {
         assert_eq!(
@@ -477,6 +838,55 @@ mod tests {
             vec![1, 2, 3, 4, 5]
         );
     }
+    #[tokio::test]
+    async fn fused_retrieval_modes_fallback_and_vector_hydration() {
+        let dir = tempfile::tempdir().unwrap();
+        let files = dir.path().join("files");
+        std::fs::create_dir(&files).unwrap();
+        std::fs::write(files.join("match.txt"), "nebula evidence.").unwrap();
+        std::fs::write(files.join("vector.txt"), "quasar vector evidence.").unwrap();
+        let store = Store::open(&dir.path().join("index.sqlite")).unwrap();
+        let root = store.add_root(&files).unwrap();
+        store.scan(&root, |_| {}).unwrap();
+        let mut options = Retrieval { max_hops: 0, mode: crate::types::RetrievalMode::Accurate, top_k: 1, ..Default::default() };
+        let cancel = CancellationToken::new();
+        async fn score(mut candidates: Vec<Candidate>, _: Vec<Candidate>) -> Result<Vec<Candidate>> {
+            for candidate in &mut candidates { candidate.score = 0.9; }
+            Ok(candidates)
+        }
+        let plain = retrieve(&store, "nebula", &[], &[], &options, &cancel, score, |_, _| {}).await.unwrap();
+        assert!(!plain.results.is_empty());
+        let degraded = retrieve_fused(&store, "nebula", &[], &[], &options, &[], &cancel, score, |_, _| {}).await.unwrap();
+        assert_eq!(serde_json::to_value(&plain).unwrap(), serde_json::to_value(&degraded).unwrap());
+        let vector = store.candidate_query(&match_query("quasar"), None, &[], &[], &[], options.candidate_k).unwrap().remove(0);
+        let vectors = vec![vec![], vec![vector.id, i64::MAX]];
+        let fused = retrieve_fused(&store, "nebula", &[], &[], &options, &vectors, &cancel, score, |_, _| {}).await.unwrap();
+        assert_eq!(fused.results.len(), 2);
+        assert_eq!(fused.results[1].content, vector.content);
+        assert_eq!(fused.results[1].source_ranges, vector.source_ranges);
+        assert_eq!(fused.results[1].document_id, vector.document_id);
+        assert_eq!(fused.results[1].order, 1);
+        let only_vector = retrieve_fused(&store, "", &[], &[], &options, &vectors, &cancel, score, |_, _| {}).await.unwrap();
+        assert_eq!(only_vector.results.len(), 1);
+        assert_eq!(only_vector.results[0].id, vector.id);
+        let empty = retrieve_fused(&store, "", &[], &[], &options, &[vec![]], &cancel, score, |_, _| {}).await.unwrap();
+        assert!(empty.results.is_empty());
+        let scope = vec![files.join("match.txt").to_str().unwrap().to_owned()];
+        let scoped = retrieve_fused(&store, "", &scope, &[], &options, &vectors, &cancel, score, |_, _| {}).await.unwrap();
+        assert!(scoped.results.is_empty());
+        // Failure of the SAG2 scoring leg leaves the vector leg available.
+        let failed = retrieve_fused(&store, "nebula", &[], &[], &options, &vectors, &cancel,
+            |_, _| async { bail!("unavailable scoring leg") }, |_, _| {}).await.unwrap();
+        assert_eq!(failed.results.len(), 1);
+        assert_eq!(failed.results[0].id, vector.id);
+        options.mode = crate::types::RetrievalMode::Fast;
+        let fast = retrieve_fused(&store, "nebula", &[], &[], &options, &vectors, &cancel, score, |_, _| {}).await.unwrap();
+        assert_eq!(serde_json::to_value(&plain).unwrap(), serde_json::to_value(&fast).unwrap());
+        options.mode = crate::types::RetrievalMode::Accurate;
+        cancel.cancel();
+        assert!(retrieve_fused(&store, "nebula", &[], &[], &options, &vectors, &cancel, score, |_, _| {}).await.is_err());
+    }
+
     #[test]
     fn names_keep_initials_and_boundaries() {
         let names =

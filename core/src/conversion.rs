@@ -34,8 +34,19 @@ pub(crate) fn resource_failure(error: &anyhow::Error) -> bool {
             .downcast_ref::<Failure>()
             .is_some_and(|error| error.kind == FailureKind::Memory)
 }
+#[cfg(test)]
 fn run_engines(
     engines: &[&str],
+    cancel: &impl Fn() -> bool,
+    convert: impl FnMut(&str) -> Result<()>,
+    report: impl FnMut(Attempt),
+) -> Result<String> {
+    run_tier(engines, crate::types::RetrievalMode::Fast, cancel, convert, report)
+}
+
+// Accurate parsing completes Docling layout/table recognition after extraction.
+fn run_tier(
+    engines: &[&str], tier: crate::types::RetrievalMode,
     cancel: &impl Fn() -> bool,
     mut convert: impl FnMut(&str) -> Result<()>,
     mut report: impl FnMut(Attempt),
@@ -59,6 +70,7 @@ fn run_engines(
             bail!("已停止转换，未发布输出")
         }
         match result {
+            Ok(()) if tier == crate::types::RetrievalMode::Accurate && *engine == "anydoc" => continue,
             Ok(()) => return Ok((*engine).into()),
             Err(error) => {
                 resource |= resource_failure(&error);
@@ -81,6 +93,12 @@ pub(crate) fn local_formats(formats:&Option<Vec<String>>,config:&sag_protocol::m
 }
 
 pub fn identity(source: &Path, settings: &Settings) -> String {
+    let identity = fast_identity(source, settings);
+    if settings.retrieval.mode == crate::types::RetrievalMode::Accurate {
+        format!("accurate-layout-tables-v1:{identity}")
+    } else { identity }
+}
+fn fast_identity(source: &Path, settings: &Settings) -> String {
     let local = if anydoc::handles(source) {
         anydoc::CACHE_VERSION
     } else {
@@ -130,8 +148,9 @@ pub fn convert(
     fs::create_dir_all(parent)?;
     let temporary = tempfile::NamedTempFile::new_in(parent)?;
     let report = std::cell::RefCell::new(report);
-    run_engines(
+    run_tier(
         &engines,
+        settings.retrieval.mode,
         &cancel,
         |engine| {
             // Every fallback gets a fresh, unpublished result path.
@@ -194,6 +213,31 @@ pub fn convert(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn same_document_tier_runs_layout_and_tables() {
+        let document = "name,days\nAlice,40";
+        for (tier, expected) in [
+            (crate::types::RetrievalMode::Fast, vec!["anydoc"]),
+            (crate::types::RetrievalMode::Accurate, vec!["anydoc", "Docling"]),
+        ] {
+            let mut seen = vec![];
+            let mut parsed = String::new();
+            run_tier(&["anydoc", "Docling"], tier, &|| false, |engine| {
+                seen.push(engine.to_owned());
+                parsed = if engine == "anydoc" { document.into() }
+                    else { "| name | days |\n| Alice | 40 |".into() };
+                Ok(())
+            }, |_| {}).unwrap();
+            assert_eq!(seen, expected);
+            assert!(parsed.contains("40"));
+            assert_eq!(parsed.contains("| Alice |"), tier == crate::types::RetrievalMode::Accurate);
+        }
+        let mut settings = Settings::default();
+        let fast = identity(Path::new("fixture.csv"), &settings);
+        settings.retrieval.mode = crate::types::RetrievalMode::Accurate;
+        assert_ne!(fast, identity(Path::new("fixture.csv"), &settings));
+    }
+
     #[test]
     fn folder_cloud_formats_save_without_docling_but_media_still_requires_component() {
         let dir=tempfile::tempdir().unwrap();let root=dir.path().join("library");fs::create_dir(&root).unwrap();

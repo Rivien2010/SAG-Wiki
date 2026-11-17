@@ -305,12 +305,21 @@ async fn semantic_limit_keeps_every_source_span_of_selected_evidence() {
         }, None).await;
         let Response::Search(output) = response else { panic!("{response:?}") };
         assert!(!output.truncated);
-        assert_eq!(output.results.iter().map(|r| (r.start_line, r.end_line)).collect::<Vec<_>>(), vec![(1, 1), (3, 3), (5, 5)]);
+        // .md now chunks with Hierarchy by default (10.5): a heading-less
+        // document is one section, so the three sentences arrive as one
+        // chunk covering lines 1-6 instead of three sentence chunks. The
+        // semantic limit still keeps every source span of the selected
+        // evidence — all three sentences must be in the passage.
+        assert_eq!(output.results.iter().map(|r| (r.start_line, r.end_line)).collect::<Vec<_>>(), vec![(1, 6)]);
         assert!(output.results.iter().all(|r| r.path == "./session.md"));
         let passages = output.results.iter().map(|r| r.content.as_deref()).collect::<Vec<_>>();
-        assert_eq!(passages, if content {
-            vec![Some("Session access requires a valid account."), Some("Authentication checks permission."), Some("Access denied returns an error.")]
-        } else { vec![None, None, None] });
+        if content {
+            assert_eq!(passages.len(), 1);
+            let passage = passages[0].unwrap();
+            for sentence in ["Session access requires a valid account.", "Authentication checks permission.", "Access denied returns an error."] {
+                assert!(passage.contains(sentence), "selected evidence must keep every source span: {passage:?}");
+            }
+        } else { assert_eq!(passages, vec![None]); }
     }
     model.await.unwrap();
     service.shutdown();
@@ -331,14 +340,14 @@ async fn semantic_results_keep_headings_without_repeating_overlap() {
     let model = tokio::spawn(async move {
         let (mut stream, _) = listener.accept().await.unwrap();
         let payload = model_request(&mut stream).await;
-        assert!(payload["questions"].as_object().unwrap().values().all(|q| q["instructions"]["candidate_heading"] == "Deploy / Production"));
+        assert!(payload["questions"].as_object().unwrap().values().all(|q| q["instructions"]["candidate_heading"] == "Deploy > Production"));
         let answers: serde_json::Map<String, Value> = payload["questions"].as_object().unwrap().keys().map(|key| (key.clone(), json!({"type":"noul","noul":0.9}))).collect();
         let body = json!({"answers":answers}).to_string();
         stream.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
     });
     let Response::Search(output) = send(&service, &root, Command::Search {query:"Session production permission".into(),max_results:100,content:true,timeout:3}, None).await else { panic!("search failed") };
     model.await.unwrap();
-    assert!(output.results.iter().all(|r| r.heading == "Deploy / Production" && r.path == "./session.md"));
+    assert!(output.results.iter().all(|r| r.heading == "Deploy > Production" && r.path == "./session.md"));
     let shown = output.results.iter().map(|r| r.content.as_deref().unwrap()).collect::<Vec<_>>().join("\n");
     for i in 0..12 { assert_eq!(shown.matches(&format!("End-{i:02}.")).count(), 1, "overlapping source was repeated"); }
     service.shutdown();
